@@ -162,19 +162,53 @@ async def collect_news() -> list[dict]:
             continue
         all_entries.extend(r)
 
-    # Filter: only entries with score > 0 (at least one MSP keyword)
+    # Filter: only entries with score > 0 (at least one relevant keyword)
     relevant = [e for e in all_entries if e["score"] > 0]
 
-    # Sort by score descending, then by source priority (gov > legal > media)
+    # Additional filter: news must mention Serbia or relocation-related terms
+    # to avoid showing unrelated Russian news
+    # Only Serbian-specific terms are used for filtering Russian sources
+    SERBIA_REQUIRED_TERMS = [
+        "серб", "релокац", "переезд", "внж", "пмж", "белград",
+        "nekretnine", "stan", "kuća", "iznajmljivanje", "prodaja",
+    ]
+    filtered = []
+    for e in relevant:
+        text = (e.get("title", "") + " " + e.get("summary", "")).lower()
+        # Serbian sources always pass, Russian sources must mention Serbia terms
+        if e["source"] in ["n1info.rs", "blic.rs", "b92.net", "telegraf.rs"]:
+            filtered.append(e)
+        elif any(term in text for term in SERBIA_REQUIRED_TERMS):
+            filtered.append(e)
+    relevant = filtered
+
+    # Sort by score descending, then by source priority (Serbian sources first)
     source_priority = {
-        "pravo.gov.ru": 0,
-        "economy.gov.ru": 0,
-        "nalog.gov.ru": 0,
-        "consultant.ru": 1,
-        "garant.ru": 1,
+        # Сербские источники (высший приоритет)
+        "n1info.rs": 0,
+        "b92.net": 0,
+        "blic.rs": 0,
+        "telegraf.rs": 0,
+        "rsponline.rs": 0,
+        "novosti.rs": 0,
+        "politika.rs": 0,
+        "tanjug.rs": 0,
+        "serbia.travel": 0,
+        "investserbia.org": 0,
+        # Международные источники
+        "reuters.com": 1,
+        "bbc.com": 1,
+        "euronews.com": 1,
+        # Российские источники (контекст)
         "rbc.ru": 2,
         "kommersant.ru": 2,
         "vedomosti.ru": 2,
+        "tass.ru": 2,
+        "ria.ru": 2,
+        # Русскоязычные источники о Сербии
+        "serbiarus.com": 1,
+        "serbian.rf": 1,
+        "rsmedia.ru": 1,
     }
     relevant.sort(
         key=lambda e: (-e["score"], source_priority.get(e["source"], 9)),
