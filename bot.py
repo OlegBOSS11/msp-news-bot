@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import tempfile
 from datetime import datetime, timedelta, timezone
 
@@ -441,7 +442,10 @@ async def handle_question(message: Message) -> None:
     answer = ""  # Initialize answer variable
 
     if real_estate_type == "listings":
-        # User wants to see actual property listings
+        # User wants to see actual property listings.
+        # This branch fully handles its own replies (one message per listing),
+        # so it saves history and returns early instead of falling through to
+        # the generic answer-sending code at the end of the handler.
         await message.answer("🔍 Ищу актуальные предложения недвижимости в Сербии...")
 
         try:
@@ -478,9 +482,15 @@ async def handle_question(message: Message) -> None:
                     else:
                         await message.answer(caption, parse_mode="HTML", disable_web_page_preview=True)
 
+                answer = f"Показано предложений недвижимости: {min(len(listings), 5)}."
+
         except Exception as exc:
             logger.error("Real estate search error: %s", exc)
-            await message.answer("⚠️ Ошибка при поиске недвижимости. Попробуйте позже.")
+            answer = "⚠️ Ошибка при поиске недвижимости. Попробуйте позже."
+            await message.answer(answer)
+
+        await database.save_message(user_id, "assistant", answer)
+        return
 
     elif real_estate_type == "info":
         # User wants information about real estate process/features
@@ -539,8 +549,6 @@ async def handle_question(message: Message) -> None:
 
 
 # --- Voice message handler ---
-
-import asyncio
 
 async def transcribe_voice(voice_file_id: str) -> str | None:
     """Download voice message, convert OGG to WAV, and transcribe."""
