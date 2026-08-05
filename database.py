@@ -72,6 +72,18 @@ async def register_user(user_id: int, username: str = "") -> None:
         logger.error("DB register_user error: %s", exc)
 
 
+async def get_all_user_ids() -> list[int]:
+    """Return the user_id of every user who has ever started the bot."""
+    try:
+        async with aiosqlite.connect(DB_PATH) as db:
+            cursor = await db.execute("SELECT user_id FROM users")
+            rows = await cursor.fetchall()
+            return [row[0] for row in rows]
+    except Exception as exc:
+        logger.error("DB get_all_user_ids error: %s", exc)
+        return []
+
+
 async def is_sent(link: str) -> bool:
     """Return True if the link was already sent."""
     try:

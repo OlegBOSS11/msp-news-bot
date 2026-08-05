@@ -199,7 +199,7 @@ async def _send_digest_parts(chat_id: int, parts: list[str]) -> None:
 
 
 async def send_daily_digest() -> None:
-    """Broadcast the scheduled digest to the configured channel (config.CHAT_ID).
+    """Broadcast the scheduled digest to every user who has started the bot.
 
     Called only by the 10:00/18:00 scheduler jobs. Marks sent items so the
     same story is never broadcast twice.
@@ -211,7 +211,13 @@ async def send_daily_digest() -> None:
         return
 
     parts = await _build_digest_parts(fresh)
-    await _send_digest_parts(config.CHAT_ID, parts)
+
+    user_ids = await database.get_all_user_ids()
+    if not user_ids:
+        logger.warning("No subscribed users found — digest was not sent to anyone.")
+    for user_id in user_ids:
+        await _send_digest_parts(user_id, parts)
+        await asyncio.sleep(0.05)  # stay well under Telegram's rate limits
 
     for item in fresh:
         try:
@@ -219,7 +225,7 @@ async def send_daily_digest() -> None:
         except Exception as exc:
             logger.warning("DB mark_sent failed: %s", exc)
 
-    logger.info("Digest sent successfully (%d items).", len(fresh))
+    logger.info("Digest sent to %d subscribers (%d items).", len(user_ids), len(fresh))
 
 
 async def send_personal_digest(chat_id: int) -> bool:
@@ -227,7 +233,7 @@ async def send_personal_digest(chat_id: int) -> bool:
 
     Unlike send_daily_digest(), this does NOT call database.mark_sent() —
     it's a personal, on-demand view, so it must not suppress the scheduled
-    broadcast from later posting the same stories to config.CHAT_ID.
+    broadcast from later reaching every subscribed user.
 
     Returns True if a digest was actually sent, False if there was nothing new.
     """
