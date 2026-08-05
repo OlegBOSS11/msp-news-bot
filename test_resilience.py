@@ -56,13 +56,15 @@ class TestRSSResilience:
         from parser import collect_news
 
         with patch("parser._fetch_feed") as mock_fetch:
-            # First feed fails, others return data
+            # First feed fails, others return data.
+            # Russian-source items must mention Serbia to survive collect_news()'s
+            # relocation-relevance filter (Serbian-domain sources pass unfiltered).
             mock_fetch.side_effect = [
                 Exception("Connection timeout"),
-                [{"title": "Test news", "link": "https://kommersant.ru/test",
-                  "summary": "Test", "score": 1, "source": "kommersant.ru"}],
-                [{"title": "Test news 2", "link": "https://vedomosti.ru/test",
-                  "summary": "Test 2", "score": 1, "source": "vedomosti.ru"}],
+                [{"title": "Новости Сербии", "link": "https://kommersant.ru/test",
+                  "summary": "Релокация в Сербию", "score": 1, "source": "kommersant.ru"}],
+                [{"title": "Новости Сербии 2", "link": "https://vedomosti.ru/test",
+                  "summary": "Релокация в Сербию", "score": 1, "source": "vedomosti.ru"}],
             ]
             with patch("parser.RSS_FEEDS", [
                 {"name": "garant.ru", "url": "https://test1"},
@@ -136,9 +138,17 @@ class TestGigaChatResilience:
     @pytest.mark.asyncio
     async def test_gigachat_timeout(self):
         """Bot should handle GigaChat timeout."""
-        with patch("bot.giga.achat", side_effect=Exception("Timeout")):
+        mock_giga = MagicMock()
+        mock_giga.achat = AsyncMock(side_effect=Exception("Timeout"))
+
+        # get_gigachat_client() (not a module-level `bot.giga`) is what bot.py
+        # actually calls — patch that instead.
+        with patch("bot.get_gigachat_client", return_value=mock_giga):
             from bot import handle_question
             message = AsyncMock()
+            # Deliberately generic text so it goes through the plain-GigaChat
+            # branch of handle_question rather than the real-estate/Serbia
+            # web-search branches.
             message.text = "Test question"
             message.from_user.id = 123
             message.chat.id = 123
@@ -156,8 +166,10 @@ class TestGigaChatResilience:
         """Bot should handle invalid GigaChat response."""
         mock_response = MagicMock()
         mock_response.choices = []
+        mock_giga = MagicMock()
+        mock_giga.achat = AsyncMock(return_value=mock_response)
 
-        with patch("bot.giga.achat", return_value=mock_response):
+        with patch("bot.get_gigachat_client", return_value=mock_giga):
             from bot import handle_question
             message = AsyncMock()
             message.text = "Test"
@@ -177,10 +189,13 @@ class TestTelegramResilience:
 
     @pytest.mark.asyncio
     async def test_send_message_fails(self):
-        """Bot should continue if sending one message fails."""
+        """Bot should keep broadcasting to other subscribers if one send fails."""
         from bot import send_daily_digest
 
-        with patch("parser.collect_news", return_value=[
+        # bot.py does `from parser import collect_news`, so the name to patch
+        # is bot.collect_news (where it's looked up), not parser.collect_news
+        # (where it's defined) — otherwise this would hit the real network.
+        with patch("bot.collect_news", return_value=[
             {"title": "News 1", "link": "https://test1.com",
              "summary": "Summary 1", "score": 1, "source": "test"},
             {"title": "News 2", "link": "https://test2.com",
@@ -188,17 +203,22 @@ class TestTelegramResilience:
         ]):
             with patch("database.is_sent", return_value=False):
                 with patch("database.mark_sent", new_callable=AsyncMock):
-                    call_count = 0
+                    # Two subscribers, so the broadcast loop actually has
+                    # something to iterate over.
+                    with patch("database.get_all_user_ids", return_value=[111, 222]):
+                        call_count = 0
 
-                    async def failing_send(**kwargs):
-                        nonlocal call_count
-                        call_count += 1
-                        if call_count == 1:
-                            raise Exception("Telegram API error")
+                        async def failing_send(**kwargs):
+                            nonlocal call_count
+                            call_count += 1
+                            if call_count == 1:
+                                raise Exception("Telegram API error")
 
-                    with patch("bot.bot.send_message", side_effect=failing_send):
-                        # Should not crash
-                        await send_daily_digest()
+                        with patch("bot.bot.send_message", side_effect=failing_send):
+                            # Should not crash, and the second subscriber
+                            # should still receive their digest.
+                            await send_daily_digest()
+                            assert call_count == 2
 
 
 # --- Test 5: Voice transcription failures ---
@@ -253,7 +273,7 @@ class TestSchedulerResilience:
         """Scheduler should continue even if digest fails."""
         from bot import send_daily_digest
 
-        with patch("parser.collect_news", side_effect=Exception("Network error")):
+        with patch("bot.collect_news", side_effect=Exception("Network error")):
             # Should not raise
             await send_daily_digest()
 

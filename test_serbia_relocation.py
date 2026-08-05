@@ -256,10 +256,18 @@ class TestGigaChatResilience:
     @pytest.mark.asyncio
     async def test_gigachat_timeout(self):
         """Bot should handle GigaChat timeout."""
-        with patch("bot.giga.achat", side_effect=Exception("Timeout")):
+        mock_giga = MagicMock()
+        mock_giga.achat = AsyncMock(side_effect=Exception("Timeout"))
+
+        # get_gigachat_client() (not a module-level `bot.giga`) is what bot.py
+        # actually calls — patch that instead.
+        with patch("bot.get_gigachat_client", return_value=mock_giga):
             from bot import handle_question
             message = AsyncMock()
-            message.text = "Как получить ВНЖ в Сербии?"
+            # Deliberately generic text: a Serbia/relocation-flavored question
+            # would route through get_serbia_answer()'s web-search branch
+            # instead of the plain-GigaChat branch this test targets.
+            message.text = "Test question"
             message.from_user.id = 123
             message.chat.id = 123
             message.answer = AsyncMock()
