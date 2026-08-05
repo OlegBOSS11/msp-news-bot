@@ -313,12 +313,25 @@ async def search_real_estate(query: str = "") -> list[PropertyListing]:
     return all_listings[:15]  # Limit to 15 results
 
 
-def format_listings(listings: list[PropertyListing]) -> str:
-    """Format property listings for Telegram message."""
+def format_listings(listings: list[PropertyListing], is_predefined: bool = False) -> str:
+    """Format property listings for Telegram message.
+
+    Args:
+        is_predefined: True when `listings` came from the static
+            PREDEFINED_LISTINGS fallback rather than a live scrape — the
+            caller should set this so the message warns the user that the
+            prices/links may be outdated.
+    """
     if not listings:
         return "🏠 К сожалению, подходящих предложений не найдено. Попробуйте изменить запрос."
 
     lines = ["🏠 <b>Актуальные предложения недвижимости в Сербии:</b>\n"]
+    if is_predefined:
+        lines.append(
+            "⚠️ <i>Не удалось получить свежие данные с сайтов. Это примерные "
+            "варианты — актуальность цен и наличие не гарантированы, "
+            "проверяйте по ссылке.</i>\n"
+        )
 
     for i, listing in enumerate(listings, 1):
         lines.append(f"<b>{i}. {listing.title}</b>")
@@ -484,15 +497,24 @@ PREDEFINED_LISTINGS = [
 ]
 
 
-async def search_real_estate_with_fallback(query: str = "") -> list[PropertyListing]:
-    """Search for real estate listings with fallback to predefined links."""
+async def search_real_estate_with_fallback(query: str = "") -> tuple[list[PropertyListing], bool]:
+    """Search for real estate listings with fallback to predefined links.
+
+    Returns:
+        A tuple of (listings, is_predefined). `is_predefined` is True when
+        live scraping failed and the static PREDEFINED_LISTINGS were used
+        instead — callers should surface this to the user, since those
+        prices/links are not guaranteed to be current.
+    """
     # Try to scrape websites first
     listings = await search_real_estate(query)
+    is_predefined = False
 
     # If no listings found, use predefined links with filtering
     if not listings:
         logger.info("Using predefined real estate listings as fallback")
         listings = PREDEFINED_LISTINGS
+        is_predefined = True
 
         # Filter predefined listings based on query keywords
         if query:
@@ -530,4 +552,4 @@ async def search_real_estate_with_fallback(query: str = "") -> list[PropertyList
             if filtered:
                 listings = filtered
 
-    return listings[:15]
+    return listings[:15], is_predefined

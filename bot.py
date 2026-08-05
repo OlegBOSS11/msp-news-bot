@@ -494,7 +494,7 @@ async def handle_question(message: Message) -> None:
         await message.answer("🔍 Ищу актуальные предложения недвижимости в Сербии...")
 
         try:
-            listings = await search_real_estate_with_fallback(user_text)
+            listings, is_predefined = await search_real_estate_with_fallback(user_text)
 
             if not listings:
                 answer = "📋 <b>Популярные сайты для поиска недвижимости:</b>\n"
@@ -502,6 +502,13 @@ async def handle_question(message: Message) -> None:
                 answer += "• <a href=\"https://www.avito.ru/all/serbiya/nedvizhimost\">Авито</a>\n"
                 await message.answer(answer, parse_mode="HTML", disable_web_page_preview=True)
             else:
+                if is_predefined:
+                    await message.answer(
+                        "⚠️ Не удалось получить свежие данные с сайтов. Ниже — примерные "
+                        "варианты, актуальность цен и наличие не гарантированы, "
+                        "проверяйте по ссылке.",
+                    )
+
                 # Send first listing with photo if available
                 for i, listing in enumerate(listings[:5]):
                     caption = (
@@ -528,6 +535,8 @@ async def handle_question(message: Message) -> None:
                         await message.answer(caption, parse_mode="HTML", disable_web_page_preview=True)
 
                 answer = f"Показано предложений недвижимости: {min(len(listings), 5)}."
+                if is_predefined:
+                    answer += " (примерные варианты, не живые данные)"
 
         except Exception as exc:
             logger.error("Real estate search error: %s", exc)
