@@ -128,13 +128,13 @@ async def _format_news_block(idx: int, item: dict) -> str:
     )
 
 
-async def send_daily_digest() -> None:
-    logger.info("Starting daily digest collection...")
+async def _collect_fresh_news() -> list[dict]:
+    """Collect today's news, filtered to items not yet sent to the broadcast channel."""
     try:
         news = await collect_news()
     except Exception as exc:
         logger.error("Failed to collect news: %s", exc, exc_info=True)
-        return
+        return []
 
     fresh: list[dict] = []
     for item in news:
@@ -144,11 +144,11 @@ async def send_daily_digest() -> None:
         except Exception as exc:
             logger.warning("DB check failed for %s: %s", item["link"], exc)
             fresh.append(item)
+    return fresh
 
-    if not fresh:
-        logger.info("No new MSP news found for today.")
-        return
 
+async def _build_digest_parts(fresh: list[dict]) -> list[str]:
+    """Format news items into one or more Telegram-message-sized chunks."""
     today = datetime.now(MOSCOW_TZ).strftime("%d.%m.%Y")
     header = (
         f"📊 <b>Ежедневная сводка о Сербии на {today}.</b>\n"
@@ -182,16 +182,36 @@ async def send_daily_digest() -> None:
         current += footer
         parts.append(current)
 
+    return parts
+
+
+async def _send_digest_parts(chat_id: int, parts: list[str]) -> None:
     for part in parts:
         try:
             await bot.send_message(
-                chat_id=config.CHAT_ID,
+                chat_id=chat_id,
                 text=part,
                 parse_mode="HTML",
                 disable_web_page_preview=True,
             )
         except Exception as exc:
             logger.error("Failed to send message: %s", exc, exc_info=True)
+
+
+async def send_daily_digest() -> None:
+    """Broadcast the scheduled digest to the configured channel (config.CHAT_ID).
+
+    Called only by the 10:00/18:00 scheduler jobs. Marks sent items so the
+    same story is never broadcast twice.
+    """
+    logger.info("Starting daily digest collection...")
+    fresh = await _collect_fresh_news()
+    if not fresh:
+        logger.info("No new MSP news found for today.")
+        return
+
+    parts = await _build_digest_parts(fresh)
+    await _send_digest_parts(config.CHAT_ID, parts)
 
     for item in fresh:
         try:
@@ -200,6 +220,25 @@ async def send_daily_digest() -> None:
             logger.warning("DB mark_sent failed: %s", exc)
 
     logger.info("Digest sent successfully (%d items).", len(fresh))
+
+
+async def send_personal_digest(chat_id: int) -> bool:
+    """Send an on-demand digest to a single chat (used by /digest and the button).
+
+    Unlike send_daily_digest(), this does NOT call database.mark_sent() —
+    it's a personal, on-demand view, so it must not suppress the scheduled
+    broadcast from later posting the same stories to config.CHAT_ID.
+
+    Returns True if a digest was actually sent, False if there was nothing new.
+    """
+    logger.info("Collecting personal digest for chat %s...", chat_id)
+    fresh = await _collect_fresh_news()
+    if not fresh:
+        return False
+
+    parts = await _build_digest_parts(fresh)
+    await _send_digest_parts(chat_id, parts)
+    return True
 
 
 # --- Welcome message ---
@@ -321,9 +360,9 @@ async def cmd_news(message: Message) -> None:
 @dp.message(Command("digest"))
 async def cmd_digest(message: Message) -> None:
     await message.answer("⏳ Собираю новости...")
-    await send_daily_digest()
+    sent = await send_personal_digest(message.chat.id)
     await message.answer(
-        "✅ Сводка отправлена!",
+        "✅ Сводка отправлена!" if sent else "📭 Новых новостей пока нет.",
         reply_markup=main_menu_kb(),
     )
 
@@ -416,9 +455,9 @@ async def cb_news(callback: CallbackQuery) -> None:
 async def cb_digest(callback: CallbackQuery) -> None:
     await callback.message.edit_text("⏳ Собираю новости...")
     await callback.answer()
-    await send_daily_digest()
+    sent = await send_personal_digest(callback.message.chat.id)
     await callback.message.edit_text(
-        "✅ Сводка отправлена!",
+        "✅ Сводка отправлена!" if sent else "📭 Новых новостей пока нет.",
         reply_markup=main_menu_kb(),
     )
 

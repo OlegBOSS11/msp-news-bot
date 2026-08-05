@@ -25,7 +25,6 @@ WHITELIST_DOMAINS: set[str] = {
     "telegraf.rs",
     # Русскоязычные источники о Сербии
     "serbiarus.com",
-    "serbian.rf",
     "rsmedia.ru",
     # Международные источники
     "reuters.com",

@@ -206,7 +206,6 @@ async def collect_news() -> list[dict]:
         "ria.ru": 2,
         # Русскоязычные источники о Сербии
         "serbiarus.com": 1,
-        "serbian.rf": 1,
         "rsmedia.ru": 1,
     }
     relevant.sort(
