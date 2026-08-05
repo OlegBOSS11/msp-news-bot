@@ -150,8 +150,7 @@ async def _fetch_feed(
 
 async def collect_news() -> list[dict]:
     """Gather, filter, and rank news from all whitelisted feeds."""
-    connector = aiohttp.TCPConnector(ssl=False)
-    async with aiohttp.ClientSession(connector=connector) as session:
+    async with aiohttp.ClientSession() as session:
         tasks = [_fetch_feed(session, cfg) for cfg in RSS_FEEDS]
         results = await asyncio.gather(*tasks, return_exceptions=True)
 
