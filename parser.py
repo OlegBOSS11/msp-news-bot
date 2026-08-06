@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import socket
 from datetime import datetime, timedelta, timezone
 from email.utils import parsedate_to_datetime
 from urllib.parse import urlparse
@@ -150,7 +151,11 @@ async def _fetch_feed(
 
 async def collect_news() -> list[dict]:
     """Gather, filter, and rank news from all whitelisted feeds."""
-    async with aiohttp.ClientSession() as session:
+    # Force IPv4: some hosts (e.g. IPv6-less VDS) have working IPv4 routes
+    # but no IPv6 route, and letting aiohttp's happy-eyeballs try IPv6 first
+    # can cause intermittent connection failures instead of a clean fallback.
+    connector = aiohttp.TCPConnector(family=socket.AF_INET)
+    async with aiohttp.ClientSession(connector=connector) as session:
         tasks = [_fetch_feed(session, cfg) for cfg in RSS_FEEDS]
         results = await asyncio.gather(*tasks, return_exceptions=True)
 

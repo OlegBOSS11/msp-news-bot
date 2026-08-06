@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import re
+import socket
 from dataclasses import dataclass
 from urllib.parse import quote_plus
 
@@ -35,7 +36,9 @@ async def search_web(query: str, num_results: int = 5) -> list[SearchResult]:
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
         }
 
-        async with aiohttp.ClientSession() as session:
+        # Force IPv4 — see the comment in parser.collect_news() for why.
+        connector = aiohttp.TCPConnector(family=socket.AF_INET)
+        async with aiohttp.ClientSession(connector=connector) as session:
             async with session.get(search_url, headers=headers, timeout=aiohttp.ClientTimeout(total=15)) as resp:
                 if resp.status == 200:
                     html = await resp.text()
