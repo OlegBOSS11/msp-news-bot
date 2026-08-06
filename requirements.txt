@@ -7,5 +7,5 @@ lxml==6.1.1
 gigachat==0.2.1
 beautifulsoup4==4.12.3
 aiohttp==3.10.5
-SpeechRecognition==3.10.4
+SpeechRecognition==3.17.0
 pydub==0.25.1
