@@ -695,6 +695,11 @@ async def main() -> None:
     await database.init_db()
     logger.info("Database initialized.")
 
+    # Long polling and webhooks are mutually exclusive on Telegram's side —
+    # drop any webhook left over from a previous deployment/test so
+    # getUpdates() doesn't fail with TelegramConflictError.
+    await bot.delete_webhook(drop_pending_updates=True)
+
     scheduler = AsyncIOScheduler(timezone=config.TIMEZONE)
     scheduler.add_job(
         send_daily_digest,
