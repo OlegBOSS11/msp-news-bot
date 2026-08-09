@@ -2,29 +2,22 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 
-from gigachat_client import get_gigachat_client
+from deep_translator import GoogleTranslator
+from deep_translator.exceptions import BaseError as TranslationError
 
 logger = logging.getLogger(__name__)
 
-# System prompt for translation
-TRANSLATION_PROMPT = """Ты — профессиональный переводчик с сербского на русский язык.
 
-Переводи новости и тексты с сербского (кириллица и латиница) на русский язык.
-
-Правила перевода:
-1. Переводи точно, сохраняя смысл оригинала
-2. Используй естественный русский язык
-3. Сохраняй имена собственные, названия организаций
-4. Если текст уже на русском — верни его как есть
-5. Кратко и по существу
-
-Формат ответа: только переведенный текст, без пояснений."""
+def _translate_sync(text: str) -> str:
+    """Blocking call to Google Translate (via deep-translator). Run in a thread."""
+    return GoogleTranslator(source="auto", target="ru").translate(text)
 
 
 async def translate_to_russian(text: str) -> str:
-    """Translate text from Serbian to Russian using GigaChat."""
+    """Translate text from Serbian to Russian using a free translation service."""
     if not text:
         return text
 
@@ -48,21 +41,9 @@ async def translate_to_russian(text: str) -> str:
             return text
 
     try:
-        from gigachat.models.chat import Chat, Messages
-
-        giga = get_gigachat_client()
-        if not giga:
-            logger.error("GigaChat client not available")
-            return text
-
-        messages = [
-            Messages(role="system", content=TRANSLATION_PROMPT),
-            Messages(role="user", content=f"Переведи на русский:\n\n{text}"),
-        ]
-
-        chat = Chat(model="GigaChat", messages=messages)
-        response = await giga.achat(chat)
-        translated = response.choices[0].message.content
+        # GoogleTranslator.translate() makes a blocking HTTP request —
+        # run it off the event loop so it doesn't stall the whole bot.
+        translated = await asyncio.to_thread(_translate_sync, text)
 
         # If translation is empty or error, return original
         if not translated or len(translated) < len(text) * 0.3:
@@ -70,8 +51,11 @@ async def translate_to_russian(text: str) -> str:
 
         return translated
 
-    except Exception as exc:
+    except TranslationError as exc:
         logger.error("Translation error: %s", exc)
+        return text
+    except Exception as exc:
+        logger.error("Unexpected translation error: %s", exc)
         return text
 
 
