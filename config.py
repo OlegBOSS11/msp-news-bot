@@ -8,7 +8,7 @@ CHAT_ID: int = int(os.environ["CHAT_ID"])
 GIGACHAT_CREDENTIALS: str = os.environ["GIGACHAT_CREDENTIALS"]
 
 # --- Serbian news sources (for translation) ---
-SERBIAN_NEWS_SOURCES: list[str] = ["n1info.rs", "blic.rs", "telegraf.rs", "b92.net"]
+SERBIAN_NEWS_SOURCES: list[str] = ["n1info.rs", "blic.rs", "telegraf.rs", "b92.net", "kurir.rs"]
 
 # --- Whitelist domains (only these are parsed) ---
 WHITELIST_DOMAINS: set[str] = {
@@ -23,12 +23,15 @@ WHITELIST_DOMAINS: set[str] = {
     "serbia.travel",
     "investserbia.org",
     "telegraf.rs",
+    "kurir.rs",
     # Русскоязычные источники о Сербии
     "serbiarus.com",
     "rsmedia.ru",
+    "ruserbia.com",
     # Международные источники
     "reuters.com",
     "bbc.com",
+    "bbci.co.uk",  # BBC's actual RSS feeds are served from this domain
     "euronews.com",
     # Российские источники (для сравнения/контекста)
     "rbc.ru",
@@ -36,6 +39,8 @@ WHITELIST_DOMAINS: set[str] = {
     "vedomosti.ru",
     "tass.ru",
     "ria.ru",
+    "radiosputnik.ru",
+    "rg.ru",
 }
 
 # --- RSS / Atom feeds to poll ---
@@ -55,6 +60,24 @@ RSS_FEEDS: list[dict[str, str]] = [
         "name": "telegraf.rs",
         "url": "https://www.telegraf.rs/rss",
     },
+    {
+        "name": "kurir.rs",
+        "url": "https://www.kurir.rs/rss/",
+    },
+    # --- Русскоязычные источники о Сербии ---
+    {
+        "name": "ruserbia.com",
+        "url": "https://ruserbia.com/feed/",
+    },
+    # --- Международные источники ---
+    {
+        "name": "euronews.com",
+        "url": "https://ru.euronews.com/rss",
+    },
+    {
+        "name": "bbci.co.uk",
+        "url": "http://feeds.bbci.co.uk/russian/rss.xml",
+    },
     # --- Российские источники (контекст) ---
     {
         "name": "tass.ru",
@@ -63,6 +86,14 @@ RSS_FEEDS: list[dict[str, str]] = [
     {
         "name": "ria.ru",
         "url": "https://ria.ru/export/rss2/archive/index.xml",
+    },
+    {
+        "name": "radiosputnik.ru",
+        "url": "https://radiosputnik.ru/export/rss2/archive/index.xml",
+    },
+    {
+        "name": "rg.ru",
+        "url": "https://rg.ru/xml/index.xml",
     },
 ]
 
