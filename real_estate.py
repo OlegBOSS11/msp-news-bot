@@ -48,9 +48,11 @@ REAL_ESTATE_SOURCES = [
 # local real_estate_listings DB table (see database.upsert_real_estate_listing).
 # Kept short and polite (small number of pages, delay between requests) —
 # this runs unattended every few hours, not on every user request.
+HALOOGLASI_CITIES = ["beograd", "novi-sad", "nis", "kragujevac"]
 HALOOGLASI_COLLECTOR_URLS = [
-    "https://www.halooglasi.com/nekretnine/prodaja-stanova/beograd",
-    "https://www.halooglasi.com/nekretnine/izdavanje-stanova/beograd",
+    f"https://www.halooglasi.com/nekretnine/{deal}-stanova/{city}"
+    for city in HALOOGLASI_CITIES
+    for deal in ("prodaja", "izdavanje")
 ]
 
 
