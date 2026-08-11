@@ -16,6 +16,7 @@ from aiogram.types import (
 )
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
+from apscheduler.triggers.interval import IntervalTrigger
 from gigachat.models.chat import Chat, Messages
 import speech_recognition as sr
 
@@ -23,7 +24,12 @@ import config
 import database
 from gigachat_client import get_gigachat_client
 from parser import collect_news
-from real_estate import search_real_estate_with_fallback, format_listings, is_real_estate_query
+from real_estate import (
+    search_real_estate_with_fallback,
+    format_listings,
+    is_real_estate_query,
+    refresh_real_estate_database,
+)
 from serbia_search import get_serbia_answer
 from translator import translate_to_russian, detect_language
 
@@ -713,8 +719,21 @@ async def main() -> None:
         id="evening_digest",
         replace_existing=True,
     )
+    scheduler.add_job(
+        refresh_real_estate_database,
+        trigger=IntervalTrigger(hours=6),
+        id="real_estate_collector",
+        replace_existing=True,
+    )
     scheduler.start()
     logger.info("Scheduler started — next runs at 10:00 and 18:00 MSK.")
+
+    logger.info("Collecting real estate listings...")
+    try:
+        count = await refresh_real_estate_database()
+        logger.info("Real estate collector: %d listings on startup.", count)
+    except Exception as exc:
+        logger.error("Real estate collector failed on startup: %s", exc, exc_info=True)
 
     logger.info("Sending initial digest now...")
     await send_daily_digest()

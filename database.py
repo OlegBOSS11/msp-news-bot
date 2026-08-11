@@ -45,6 +45,21 @@ async def init_db() -> None:
             )
             """
         )
+        await db.execute(
+            """
+            CREATE TABLE IF NOT EXISTS real_estate_listings (
+                ad_id      TEXT PRIMARY KEY,
+                title      TEXT NOT NULL,
+                price      TEXT,
+                location   TEXT,
+                url        TEXT NOT NULL,
+                image_url  TEXT,
+                source     TEXT NOT NULL,
+                first_seen TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                last_seen  TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+            """
+        )
         await db.commit()
 
 
@@ -201,3 +216,74 @@ async def clear_conversation_history(user_id: int) -> None:
             await db.commit()
     except Exception as exc:
         logger.error("DB clear_conversation_history error: %s", exc)
+
+
+async def upsert_real_estate_listing(
+    ad_id: str,
+    title: str,
+    price: str | None,
+    location: str | None,
+    url: str,
+    image_url: str | None,
+    source: str,
+) -> None:
+    """Insert a listing, or refresh it (and bump last_seen) if already known."""
+    try:
+        async with aiosqlite.connect(DB_PATH) as db:
+            await db.execute(
+                """
+                INSERT INTO real_estate_listings
+                    (ad_id, title, price, location, url, image_url, source, last_seen)
+                VALUES (?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+                ON CONFLICT(ad_id) DO UPDATE SET
+                    title=excluded.title,
+                    price=excluded.price,
+                    location=excluded.location,
+                    url=excluded.url,
+                    image_url=excluded.image_url,
+                    source=excluded.source,
+                    last_seen=CURRENT_TIMESTAMP
+                """,
+                (ad_id, title, price, location, url, image_url, source),
+            )
+            await db.commit()
+    except Exception as exc:
+        logger.error("DB upsert_real_estate_listing error: %s", exc)
+
+
+async def get_real_estate_listings(limit: int = 100) -> list[dict]:
+    """Return the most recently seen real estate listings."""
+    try:
+        async with aiosqlite.connect(DB_PATH) as db:
+            db.row_factory = aiosqlite.Row
+            cursor = await db.execute(
+                """
+                SELECT ad_id, title, price, location, url, image_url, source
+                FROM real_estate_listings
+                ORDER BY last_seen DESC
+                LIMIT ?
+                """,
+                (limit,),
+            )
+            rows = await cursor.fetchall()
+            return [dict(row) for row in rows]
+    except Exception as exc:
+        logger.error("DB get_real_estate_listings error: %s", exc)
+        return []
+
+
+async def prune_stale_listings(days: int = 7) -> None:
+    """Delete listings that haven't been seen by the collector in `days` days.
+
+    Ads eventually get taken down (sold, rented, expired) — this keeps the
+    table from silently accumulating dead listings forever.
+    """
+    try:
+        async with aiosqlite.connect(DB_PATH) as db:
+            await db.execute(
+                "DELETE FROM real_estate_listings WHERE last_seen < datetime('now', ?)",
+                (f"-{days} days",),
+            )
+            await db.commit()
+    except Exception as exc:
+        logger.error("DB prune_stale_listings error: %s", exc)

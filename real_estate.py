@@ -12,6 +12,8 @@ from urllib.parse import urljoin
 import aiohttp
 from bs4 import BeautifulSoup
 
+import database
+
 logger = logging.getLogger(__name__)
 
 # Popular Serbian real estate websites
@@ -27,11 +29,27 @@ REAL_ESTATE_SOURCES = [
         ],
     },
     {
+        # Confirmed reachable (unlike CityExpert/nekretnine.rs, which block
+        # scripted requests) — August 2026.
+        "name": "HaloOglasi",
+        "base_url": "https://www.halooglasi.com",
+        "search_url": "https://www.halooglasi.com/nekretnine/prodaja-stanova/beograd",
+    },
+    {
         "name": "Avito",
         "base_url": "https://www.avito.ru",
         "search_url": "https://www.avito.ru/all/serbiya/nedvizhimost",
         "skip_scraping": True,  # Avito requires JavaScript, can't scrape
     },
+]
+
+# Pages the background collector scrapes on a schedule to populate the
+# local real_estate_listings DB table (see database.upsert_real_estate_listing).
+# Kept short and polite (small number of pages, delay between requests) —
+# this runs unattended every few hours, not on every user request.
+HALOOGLASI_COLLECTOR_URLS = [
+    "https://www.halooglasi.com/nekretnine/prodaja-stanova/beograd",
+    "https://www.halooglasi.com/nekretnine/izdavanje-stanova/beograd",
 ]
 
 
@@ -44,6 +62,7 @@ class PropertyListing:
     location: str | None = None
     source: str = ""
     image_url: str | None = None
+    ad_id: str = ""  # stable per-site ad ID, used as the DB primary key
 
 
 async def fetch_page(url: str, timeout: int = 10) -> str | None:
@@ -101,32 +120,60 @@ def parse_nekretnine(html: str, base_url: str) -> list[PropertyListing]:
 
 
 def parse_halooglasi(html: str, base_url: str) -> list[PropertyListing]:
-    """Parse listings from halooglasi.com."""
+    """Parse listings from halooglasi.com.
+
+    Selectors confirmed against the live site in August 2026 — each result
+    card is a `.my-product-placeholder` div carrying the ad ID in
+    `data-id`, e.g.:
+
+        <div class="... my-product-placeholder" data-id="5425647385143">
+          <div class="central-feature-wrapper">
+            <div class="central-feature"><span data-value="199.800">
+              <i>199.800 €</i></span></div>
+          </div>
+          ...
+          <h3 class="product-title"><a href="/nekretnine/...">Title</a></h3>
+          <ul class="subtitle-places"><li>Beograd</li>...</ul>
+          <a class="a-images" href="..."><img src="https://img..."/></a>
+        </div>
+    """
     listings = []
     try:
         soup = BeautifulSoup(html, "html.parser")
-        cards = soup.select(".entity")
-        for card in cards[:10]:
-            title_el = card.select_one(".entity-title")
-            link_el = card.select_one(".entity-title a[href]")
-            price_el = card.select_one(".entity-price")
-            location_el = card.select_one(".entity-location")
+        cards = soup.select(".my-product-placeholder")
+        for card in cards:
+            ad_id = card.get("data-id", "")
+            title_el = card.select_one(".product-title a")
+            if not ad_id or not title_el:
+                continue
 
-            if title_el and link_el:
-                title = title_el.get_text(strip=True)
-                link = link_el.get("href", "")
-                if not link.startswith("http"):
-                    link = urljoin(base_url, link)
-                price = price_el.get_text(strip=True) if price_el else None
-                location = location_el.get_text(strip=True) if location_el else None
+            title = title_el.get_text(strip=True)
+            link = title_el.get("href", "")
+            if link and not link.startswith("http"):
+                link = urljoin(base_url, link)
 
-                listings.append(PropertyListing(
-                    title=title,
-                    url=link,
-                    price=price,
-                    location=location,
-                    source="HaloOglasi",
-                ))
+            price_el = card.select_one(".central-feature")
+            price = price_el.get_text(strip=True) if price_el else None
+
+            location_parts = [
+                li.get_text(strip=True) for li in card.select(".subtitle-places li")
+            ]
+            location = ", ".join(p for p in location_parts if p) or None
+
+            img_el = card.select_one("a.a-images img")
+            image_url = img_el.get("src") if img_el else None
+            if image_url and not image_url.startswith("http"):
+                image_url = urljoin(base_url, image_url)
+
+            listings.append(PropertyListing(
+                ad_id=ad_id,
+                title=title,
+                url=link,
+                price=price,
+                location=location,
+                source="HaloOglasi",
+                image_url=image_url,
+            ))
     except Exception as exc:
         logger.error("Error parsing halooglasi.com: %s", exc)
     return listings
@@ -275,6 +322,54 @@ def parse_avito(html: str, base_url: str) -> list[PropertyListing]:
     except Exception as exc:
         logger.error("Error parsing Avito: %s", exc)
     return listings
+
+
+async def collect_halooglasi_listings() -> list[PropertyListing]:
+    """Fetch a few halooglasi.com listing pages for the background collector.
+
+    Separate from search_real_estate()'s live per-request path — this is
+    meant to be called on a schedule (see bot.py), not per user message.
+    """
+    all_listings: list[PropertyListing] = []
+    for url in HALOOGLASI_COLLECTOR_URLS:
+        html = await fetch_page(url, timeout=15)
+        if html:
+            all_listings.extend(parse_halooglasi(html, "https://www.halooglasi.com"))
+        await asyncio.sleep(3)  # be polite between requests
+    return all_listings
+
+
+async def refresh_real_estate_database() -> int:
+    """Scrape halooglasi.com and upsert the results into the local DB.
+
+    Called by the scheduler in bot.py every few hours (and once at
+    startup) so search_real_estate_with_fallback() can serve fresh-ish
+    listings straight from SQLite instead of scraping on every user
+    request. Returns the number of listings collected (0 on failure).
+    """
+    try:
+        listings = await collect_halooglasi_listings()
+    except Exception as exc:
+        logger.error("Real estate collector failed: %s", exc, exc_info=True)
+        return 0
+
+    for listing in listings:
+        if not listing.ad_id:
+            continue
+        await database.upsert_real_estate_listing(
+            ad_id=listing.ad_id,
+            title=listing.title,
+            price=listing.price,
+            location=listing.location,
+            url=listing.url,
+            image_url=listing.image_url,
+            source=listing.source,
+        )
+
+    await database.prune_stale_listings(days=7)
+
+    logger.info("Real estate collector: upserted %d listings.", len(listings))
+    return len(listings)
 
 
 async def search_real_estate(query: str = "") -> list[PropertyListing]:
@@ -501,15 +596,47 @@ PREDEFINED_LISTINGS = [
 
 
 async def search_real_estate_with_fallback(query: str = "") -> tuple[list[PropertyListing], bool]:
-    """Search for real estate listings with fallback to predefined links.
+    """Search for real estate listings, preferring the locally collected DB.
+
+    Priority order:
+        1. The real_estate_listings DB table, populated on a schedule by
+           refresh_real_estate_database() — fast, no live request needed.
+        2. A live scrape (search_real_estate()), if the DB is empty (e.g.
+           the collector hasn't run yet).
+        3. The static PREDEFINED_LISTINGS, if even the live scrape failed.
 
     Returns:
-        A tuple of (listings, is_predefined). `is_predefined` is True when
-        live scraping failed and the static PREDEFINED_LISTINGS were used
-        instead — callers should surface this to the user, since those
-        prices/links are not guaranteed to be current.
+        A tuple of (listings, is_predefined). `is_predefined` is True only
+        for step 3 — callers should surface that to the user, since those
+        prices/links are not guaranteed to be current. DB-backed (step 1)
+        and freshly-scraped (step 2) listings are both real data.
     """
-    # Try to scrape websites first
+    db_rows = await database.get_real_estate_listings(limit=100)
+    if db_rows:
+        db_listings = [
+            PropertyListing(
+                ad_id=row["ad_id"],
+                title=row["title"],
+                url=row["url"],
+                price=row["price"],
+                location=row["location"],
+                source=row["source"],
+                image_url=row["image_url"],
+            )
+            for row in db_rows
+        ]
+        if query:
+            query_lower = query.lower()
+            matched = [
+                l for l in db_listings
+                if query_lower in l.title.lower()
+                or (l.location and query_lower in l.location.lower())
+            ]
+            if matched:
+                db_listings = matched
+        return db_listings[:15], False
+
+    # DB not populated yet (e.g. collector hasn't run) — try a live scrape.
     listings = await search_real_estate(query)
     is_predefined = False
 
