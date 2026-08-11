@@ -703,8 +703,15 @@ async def main() -> None:
 
     # Long polling and webhooks are mutually exclusive on Telegram's side —
     # drop any webhook left over from a previous deployment/test so
-    # getUpdates() doesn't fail with TelegramConflictError.
-    await bot.delete_webhook(drop_pending_updates=True)
+    # getUpdates() doesn't fail with TelegramConflictError. A transient
+    # network hiccup here must not crash the whole process (systemd would
+    # restart it, but there's no reason to pay that cost) — if this fails,
+    # dp.start_polling() below will just hit TelegramConflictError and
+    # retry with its own backoff, same as if no webhook was set at all.
+    try:
+        await bot.delete_webhook(drop_pending_updates=True)
+    except Exception as exc:
+        logger.warning("delete_webhook failed (will rely on polling's own retry): %s", exc)
 
     scheduler = AsyncIOScheduler(timezone=config.TIMEZONE)
     scheduler.add_job(
