@@ -206,19 +206,24 @@ class TestTelegramResilience:
                     # Two subscribers, so the broadcast loop actually has
                     # something to iterate over.
                     with patch("database.get_all_user_ids", return_value=[111, 222]):
-                        call_count = 0
+                        with patch("database.get_disabled_topics", return_value=set()):
+                            call_count = 0
 
-                        async def failing_send(**kwargs):
-                            nonlocal call_count
-                            call_count += 1
-                            if call_count == 1:
-                                raise Exception("Telegram API error")
+                            async def failing_send(**kwargs):
+                                nonlocal call_count
+                                call_count += 1
+                                if call_count == 1:
+                                    raise Exception("Telegram API error")
 
-                        with patch("bot.bot.send_message", side_effect=failing_send):
-                            # Should not crash, and the second subscriber
-                            # should still receive their digest.
-                            await send_daily_digest()
-                            assert call_count == 2
+                            with patch("bot.bot.send_message", side_effect=failing_send):
+                                # Should not crash. Subscriber 1's digest
+                                # header send fails (so nothing else goes
+                                # out to them), but subscriber 2 still gets
+                                # their full digest: 1 header + 1 message
+                                # per news item (2 items, no images in this
+                                # test) = 3 sends. Total = 1 + 3 = 4.
+                                await send_daily_digest()
+                                assert call_count == 4
 
 
 # --- Test 5: Voice transcription failures ---

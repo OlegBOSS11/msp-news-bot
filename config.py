@@ -164,6 +164,51 @@ MSP_KEYWORDS: list[str] = [
     "ограничен",
 ]
 
+# --- News categories for the personalized digest ---
+# Each item in the digest is tagged with every category whose keywords
+# match its title/summary (an item can belong to more than one); items
+# matching none of these fall into "general". Users pick which categories
+# they want to receive via /settings — see bot.py's topic toggle menu.
+NEWS_CATEGORIES: dict[str, dict] = {
+    "serbia": {
+        "label": "🇷🇸 Сербия и релокация",
+        "keywords": [
+            "сербия", "сербск", "релокац", "переезд", "миграц",
+            "виза", "внж", "пмж", "гражданств",
+        ],
+    },
+    "work": {
+        "label": "💼 Работа",
+        "keywords": [
+            "работа", "трудоустро", "зарплат", "резюме", "ваканси", "работодател",
+        ],
+    },
+    "realestate": {
+        "label": "🏠 Недвижимость",
+        "keywords": [
+            "недвижим", "аренд", "квартир", "дом", "покупк", "продаж",
+            "жилье", "жилая", "строительств",
+            "nekretnine", "stan", "kuća", "iznajmljivanje", "prodaja", "kupovina",
+        ],
+    },
+    "education": {
+        "label": "🎓 Образование",
+        "keywords": ["образован", "школ", "университет", "учеб", "детск"],
+    },
+    "finance": {
+        "label": "💰 Финансы и налоги",
+        "keywords": ["банк", "налог", "счет", "перевод", "валют"],
+    },
+    "documents": {
+        "label": "📄 Документы",
+        "keywords": ["документ", "паспорт", "регистрац", "справк"],
+    },
+    "general": {
+        "label": "📰 Общие новости",
+        "keywords": [],  # catch-all for items matching no other category
+    },
+}
+
 MAX_NEWS: int = 15
 
 # Moscow timezone name

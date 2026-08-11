@@ -60,6 +60,15 @@ async def init_db() -> None:
             )
             """
         )
+        await db.execute(
+            """
+            CREATE TABLE IF NOT EXISTS user_disabled_topics (
+                user_id INTEGER NOT NULL,
+                topic   TEXT    NOT NULL,
+                PRIMARY KEY (user_id, topic)
+            )
+            """
+        )
         # Migration: city / deal_type / price_value were added later, for
         # the real-estate menu's filter+sort feature. ALTER TABLE ADD
         # COLUMN is not naturally idempotent in SQLite, so on a database
@@ -362,3 +371,52 @@ async def prune_stale_listings(days: int = 7) -> None:
             await db.commit()
     except Exception as exc:
         logger.error("DB prune_stale_listings error: %s", exc)
+
+
+async def get_disabled_topics(user_id: int) -> set[str]:
+    """Return the set of news category keys this user has turned off.
+
+    Absence from this table means "on" — new users get everything by
+    default, matching the all-checked starting state in the settings menu.
+    """
+    try:
+        async with aiosqlite.connect(DB_PATH) as db:
+            cursor = await db.execute(
+                "SELECT topic FROM user_disabled_topics WHERE user_id = ?",
+                (user_id,),
+            )
+            rows = await cursor.fetchall()
+            return {row[0] for row in rows}
+    except Exception as exc:
+        logger.error("DB get_disabled_topics error: %s", exc)
+        return set()
+
+
+async def toggle_topic(user_id: int, topic: str) -> bool:
+    """Flip a user's subscription to one news category.
+
+    Returns the new enabled state (True = will now receive this topic).
+    """
+    try:
+        async with aiosqlite.connect(DB_PATH) as db:
+            cursor = await db.execute(
+                "SELECT 1 FROM user_disabled_topics WHERE user_id = ? AND topic = ?",
+                (user_id, topic),
+            )
+            currently_disabled = await cursor.fetchone() is not None
+
+            if currently_disabled:
+                await db.execute(
+                    "DELETE FROM user_disabled_topics WHERE user_id = ? AND topic = ?",
+                    (user_id, topic),
+                )
+            else:
+                await db.execute(
+                    "INSERT OR IGNORE INTO user_disabled_topics (user_id, topic) VALUES (?, ?)",
+                    (user_id, topic),
+                )
+            await db.commit()
+            return currently_disabled  # was disabled -> now enabled, and vice versa
+    except Exception as exc:
+        logger.error("DB toggle_topic error: %s", exc)
+        return True  # fail open: better to over-send than silently lose a subscriber

@@ -13,6 +13,8 @@ from aiogram.types import (
     CallbackQuery,
     InlineKeyboardMarkup,
     InlineKeyboardButton,
+    ReplyKeyboardMarkup,
+    KeyboardButton,
     URLInputFile,
 )
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
@@ -90,6 +92,20 @@ def get_system_prompt() -> str:
 
 # --- Keyboard builders ---
 
+OPEN_MENU_TEXT = "☰ Открыть меню"
+
+
+def persistent_menu_kb() -> ReplyKeyboardMarkup:
+    """A reply keyboard row that stays pinned at the bottom of the chat —
+    unlike inline buttons (tied to one message), this is reachable from
+    anywhere the user has scrolled to."""
+    return ReplyKeyboardMarkup(
+        keyboard=[[KeyboardButton(text=OPEN_MENU_TEXT)]],
+        resize_keyboard=True,
+        is_persistent=True,
+    )
+
+
 def main_menu_kb() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
         [
@@ -102,8 +118,22 @@ def main_menu_kb() -> InlineKeyboardMarkup:
         ],
         [
             InlineKeyboardButton(text="🏠 Недвижимость", callback_data="re_menu"),
+            InlineKeyboardButton(text="⚙️ Настройки", callback_data="settings_menu"),
         ],
     ])
+
+
+async def settings_topics_kb(user_id: int) -> InlineKeyboardMarkup:
+    """Checkbox-style toggle list of news categories for /settings."""
+    disabled = await database.get_disabled_topics(user_id)
+    rows = []
+    for key, cat in config.NEWS_CATEGORIES.items():
+        mark = "⬜" if key in disabled else "✅"
+        rows.append([InlineKeyboardButton(
+            text=f"{mark} {cat['label']}", callback_data=f"topic_toggle:{key}",
+        )])
+    rows.append([InlineKeyboardButton(text="◀️ Назад", callback_data="cmd_start")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 def back_button_kb() -> InlineKeyboardMarkup:
@@ -163,28 +193,14 @@ def real_estate_sort_kb(city: str, deal: str) -> InlineKeyboardMarkup:
 
 # --- News formatting ---
 
-async def _format_news_block(idx: int, item: dict) -> str:
-    """Format a news block, translating Serbian news to Russian."""
-    title = item['title']
-    summary = item.get('summary', '')
-    source = item['source']
-
-    # Check if news is from Serbian source and needs translation
-    if source in config.SERBIAN_NEWS_SOURCES:
-        # Detect language and translate if needed
-        lang = detect_language(title)
-        if lang == "serbian":
-            title = await translate_to_russian(title)
-        lang = detect_language(summary)
-        if lang == "serbian":
-            summary = await translate_to_russian(summary)
-
-    return (
-        f"<b>📌 {idx}. {title}</b>\n"
-        f"<i>Источник: {source}</i>\n"
-        f"{summary}\n"
-        f'🔗 <a href="{item["link"]}">Читать далее</a>'
-    )
+def _categorize_item(title: str, summary: str) -> set[str]:
+    """Which NEWS_CATEGORIES keys this item's text matches (never empty)."""
+    text = (title + " " + summary).lower()
+    matched = {
+        key for key, cat in config.NEWS_CATEGORIES.items()
+        if cat["keywords"] and any(kw in text for kw in cat["keywords"])
+    }
+    return matched or {"general"}
 
 
 async def _collect_fresh_news() -> list[dict]:
@@ -206,59 +222,104 @@ async def _collect_fresh_news() -> list[dict]:
     return fresh
 
 
-async def _build_digest_parts(fresh: list[dict]) -> list[str]:
-    """Format news items into one or more Telegram-message-sized chunks."""
+async def _prepare_digest_items(fresh: list[dict]) -> list[dict]:
+    """Translate (once) and tag each item with its news categories.
+
+    Done once per digest run regardless of how many subscribers there are —
+    per-user personalization only filters this shared, already-prepared list.
+    """
+    prepared = []
+    for item in fresh:
+        title = item["title"]
+        summary = item.get("summary", "")
+        source = item["source"]
+
+        if source in config.SERBIAN_NEWS_SOURCES:
+            if detect_language(title) == "serbian":
+                title = await translate_to_russian(title)
+            if detect_language(summary) == "serbian":
+                summary = await translate_to_russian(summary)
+
+        prepared.append({
+            "title": title,
+            "summary": summary,
+            "link": item["link"],
+            "source": source,
+            "image_url": item.get("image_url"),
+            "categories": _categorize_item(title, summary),
+        })
+    return prepared
+
+
+def _digest_header_text(count: int) -> str:
     today = datetime.now(MOSCOW_TZ).strftime("%d.%m.%Y")
-    header = (
+    return (
         f"📊 <b>Ежедневная сводка о Сербии на {today}.</b>\n"
         f"Актуальные новости для релокации.\n"
+        f"Новостей по вашим темам: {count}"
     )
 
-    # Format blocks with translation (async)
-    blocks = []
-    for i, item in enumerate(fresh):
-        block = await _format_news_block(i + 1, item)
-        blocks.append(block)
 
-    body = "\n\n".join(blocks)
-    footer = f"\n\n<b>Всего новостей: {len(fresh)}</b>"
-
-    message_text = header + "\n\n" + body + footer
-
-    max_len = 4000
-    parts: list[str] = []
-    if len(message_text) <= max_len:
-        parts = [message_text]
-    else:
-        current = header
-        for block in blocks:
-            candidate = current + "\n\n" + block
-            if len(candidate) > max_len:
-                parts.append(current)
-                current = block
-            else:
-                current = candidate
-        current += footer
-        parts.append(current)
-
-    return parts
+def _digest_item_caption(idx: int, item: dict) -> str:
+    """Caption for one digest item, trimmed to fit Telegram's 1024-char
+    photo caption limit (only summary gets shortened, never the markup)."""
+    header = f"<b>📌 {idx}. {item['title']}</b>\n<i>Источник: {item['source']}</i>\n"
+    footer = f'\n🔗 <a href="{item["link"]}">Читать далее</a>'
+    budget = 1024 - len(header) - len(footer) - 1
+    summary = item["summary"]
+    if budget <= 0:
+        summary = ""
+    elif len(summary) > budget:
+        summary = summary[:budget - 1] + "…"
+    return header + summary + footer
 
 
-async def _send_digest_parts(chat_id: int, parts: list[str]) -> None:
-    for part in parts:
+async def _send_digest_item(chat_id: int, idx: int, item: dict) -> None:
+    """Send one digest item — as a photo if it has an image, else plain text."""
+    caption = _digest_item_caption(idx, item)
+    if item.get("image_url"):
         try:
-            await bot.send_message(
-                chat_id=chat_id,
-                text=part,
-                parse_mode="HTML",
-                disable_web_page_preview=True,
-            )
+            photo = URLInputFile(item["image_url"])
+            await bot.send_photo(chat_id=chat_id, photo=photo, caption=caption, parse_mode="HTML")
+            return
         except Exception as exc:
-            logger.error("Failed to send message: %s", exc, exc_info=True)
+            logger.warning("Failed to send digest photo to %s: %s", chat_id, exc)
+    try:
+        await bot.send_message(
+            chat_id=chat_id, text=caption, parse_mode="HTML", disable_web_page_preview=True,
+        )
+    except Exception as exc:
+        logger.error("Failed to send digest item to %s: %s", chat_id, exc)
+
+
+async def _send_personalized_digest(chat_id: int, user_id: int, items: list[dict]) -> bool:
+    """Send only the items matching this user's enabled topics.
+
+    Returns True if anything was actually sent.
+    """
+    disabled = await database.get_disabled_topics(user_id)
+    user_items = [it for it in items if it["categories"] - disabled]
+    if not user_items:
+        return False
+
+    try:
+        await bot.send_message(
+            chat_id=chat_id, text=_digest_header_text(len(user_items)),
+            parse_mode="HTML", disable_web_page_preview=True,
+        )
+    except Exception as exc:
+        logger.error("Failed to send digest header to %s: %s", chat_id, exc)
+        return False
+
+    for i, item in enumerate(user_items, 1):
+        await _send_digest_item(chat_id, i, item)
+
+    return True
 
 
 async def send_daily_digest() -> None:
-    """Broadcast the scheduled digest to every user who has started the bot.
+    """Broadcast the scheduled digest to every user who has started the bot,
+    personalized per user by their enabled news topics.
 
     Called only by the 10:00/18:00 scheduler jobs. Marks sent items so the
     same story is never broadcast twice.
@@ -269,13 +330,15 @@ async def send_daily_digest() -> None:
         logger.info("No new MSP news found for today.")
         return
 
-    parts = await _build_digest_parts(fresh)
+    items = await _prepare_digest_items(fresh)
 
     user_ids = await database.get_all_user_ids()
     if not user_ids:
         logger.warning("No subscribed users found — digest was not sent to anyone.")
+    sent_count = 0
     for user_id in user_ids:
-        await _send_digest_parts(user_id, parts)
+        if await _send_personalized_digest(user_id, user_id, items):
+            sent_count += 1
         await asyncio.sleep(0.05)  # stay well under Telegram's rate limits
 
     for item in fresh:
@@ -284,7 +347,7 @@ async def send_daily_digest() -> None:
         except Exception as exc:
             logger.warning("DB mark_sent failed: %s", exc)
 
-    logger.info("Digest sent to %d subscribers (%d items).", len(user_ids), len(fresh))
+    logger.info("Digest sent to %d/%d subscribers (%d items collected).", sent_count, len(user_ids), len(fresh))
 
 
 async def send_personal_digest(chat_id: int) -> bool:
@@ -294,16 +357,17 @@ async def send_personal_digest(chat_id: int) -> bool:
     it's a personal, on-demand view, so it must not suppress the scheduled
     broadcast from later reaching every subscribed user.
 
-    Returns True if a digest was actually sent, False if there was nothing new.
+    Returns True if a digest was actually sent, False if there was nothing new
+    (either no fresh news at all, or none matched this user's enabled topics).
     """
     logger.info("Collecting personal digest for chat %s...", chat_id)
     fresh = await _collect_fresh_news()
     if not fresh:
         return False
 
-    parts = await _build_digest_parts(fresh)
-    await _send_digest_parts(chat_id, parts)
-    return True
+    items = await _prepare_digest_items(fresh)
+    # Private chats: chat_id == user_id, safe to reuse for topic lookup.
+    return await _send_personalized_digest(chat_id, chat_id, items)
 
 
 # --- Welcome message ---
@@ -334,6 +398,11 @@ async def cmd_start(message: Message) -> None:
     username = message.from_user.username or ""
     new = await database.is_new_user(user_id)
     await database.register_user(user_id, username)
+
+    # Pin the "☰ Открыть меню" button to the bottom of the chat — a reply
+    # keyboard (unlike inline buttons) stays reachable no matter how far
+    # the user has scrolled. Only needs setting once; Telegram remembers it.
+    await message.answer("🤖 Бот готов к работе.", reply_markup=persistent_menu_kb())
 
     if new:
         await message.answer(WELCOME_TEXT, parse_mode="HTML", reply_markup=main_menu_kb())
@@ -621,6 +690,39 @@ async def cb_real_estate_sort(callback: CallbackQuery) -> None:
         "Изменить сортировку/фильтры:",
         reply_markup=real_estate_sort_kb(city, deal),
     )
+
+
+# --- Settings (news topics) callbacks ---
+
+@dp.callback_query(F.data == "settings_menu")
+async def cb_settings_menu(callback: CallbackQuery) -> None:
+    user_id = callback.from_user.id
+    await callback.message.edit_text(
+        "⚙️ <b>Настройки дайджеста</b>\n\n"
+        "Выберите темы, которые хотите получать в ежедневной сводке "
+        "(нажмите, чтобы включить/выключить):",
+        parse_mode="HTML",
+        reply_markup=await settings_topics_kb(user_id),
+    )
+    await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("topic_toggle:"))
+async def cb_topic_toggle(callback: CallbackQuery) -> None:
+    topic = callback.data.split(":", 1)[1]
+    user_id = callback.from_user.id
+    enabled = await database.toggle_topic(user_id, topic)
+    label = config.NEWS_CATEGORIES.get(topic, {}).get("label", topic)
+    await callback.message.edit_reply_markup(reply_markup=await settings_topics_kb(user_id))
+    await callback.answer(f"{label}: {'включено' if enabled else 'выключено'}")
+
+
+# --- Persistent menu button ---
+# Registered before the F.text catch-all below so this exact match wins.
+
+@dp.message(F.text == OPEN_MENU_TEXT)
+async def cmd_open_menu(message: Message) -> None:
+    await message.answer(SIMPLE_MENU_TEXT, reply_markup=main_menu_kb())
 
 
 # --- Text message handler (GigaChat) ---

@@ -79,6 +79,40 @@ def _score(entry: dict) -> int:
     return sum(1 for kw in MSP_KEYWORDS if kw.lower() in text)
 
 
+def _entry_image(entry: dict) -> str | None:
+    """Best-effort image URL for a feed entry, for the picture-digest feature.
+
+    Tries the common RSS/Atom conventions in order of reliability:
+    media:thumbnail, media:content, <enclosure>, then a raw <img src="...">
+    inside the summary HTML. Many feeds have none of these — that's fine,
+    the caller falls back to a text-only message.
+    """
+    thumbs = entry.get("media_thumbnail") or []
+    if thumbs and thumbs[0].get("url"):
+        return thumbs[0]["url"]
+
+    media = entry.get("media_content") or []
+    for m in media:
+        url = m.get("url")
+        medium = (m.get("medium") or "").lower()
+        mtype = (m.get("type") or "").lower()
+        if url and (medium == "image" or mtype.startswith("image/") or not mtype):
+            return url
+
+    for enc in entry.get("enclosures", []) or entry.get("links", []):
+        etype = (enc.get("type") or "").lower()
+        if etype.startswith("image/") and enc.get("href"):
+            return enc["href"]
+
+    raw_html = entry.get("summary") or entry.get("description") or ""
+    import re
+    match = re.search(r'<img[^>]+src=["\']([^"\']+)["\']', raw_html)
+    if match:
+        return match.group(1)
+
+    return None
+
+
 def _entry_summary(entry: dict) -> str:
     """Plain-text summary, stripped of HTML tags."""
     import re
@@ -144,6 +178,7 @@ async def _fetch_feed(
                 "summary": _entry_summary(entry),
                 "score": _score(entry),
                 "source": name,
+                "image_url": _entry_image(entry),
             }
         )
     return results
