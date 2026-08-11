@@ -13,6 +13,7 @@ from aiogram.types import (
     CallbackQuery,
     InlineKeyboardMarkup,
     InlineKeyboardButton,
+    URLInputFile,
 )
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
@@ -99,6 +100,9 @@ def main_menu_kb() -> InlineKeyboardMarkup:
             InlineKeyboardButton(text="📊 Статус", callback_data="cmd_status"),
             InlineKeyboardButton(text="❓ Помощь", callback_data="cmd_help"),
         ],
+        [
+            InlineKeyboardButton(text="🏠 Недвижимость", callback_data="re_menu"),
+        ],
     ])
 
 
@@ -106,6 +110,55 @@ def back_button_kb() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="◀️ Назад", callback_data="cmd_start")],
     ])
+
+
+# --- Real estate menu ---
+
+REAL_ESTATE_CITY_LABELS = {
+    "beograd": "🏙 Белград",
+    "novi-sad": "🏙 Нови-Сад",
+    "nis": "🏙 Ниш",
+    "kragujevac": "🏙 Крагуевац",
+}
+
+REAL_ESTATE_DEAL_LABELS = {
+    "sale": "🛒 Купить",
+    "rent": "🏠 Снять",
+}
+
+REAL_ESTATE_SORT_LABELS = {
+    "newest": "🆕 Сначала новые",
+    "oldest": "🕰 Сначала старые",
+    "price_asc": "💰⬆️ Дешевле → дороже",
+    "price_desc": "💰⬇️ Дороже → дешевле",
+}
+
+
+def real_estate_city_kb() -> InlineKeyboardMarkup:
+    rows = [
+        [InlineKeyboardButton(text=label, callback_data=f"re_city:{slug}")]
+        for slug, label in REAL_ESTATE_CITY_LABELS.items()
+    ]
+    rows.append([InlineKeyboardButton(text="◀️ Назад", callback_data="cmd_start")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def real_estate_deal_kb(city: str) -> InlineKeyboardMarkup:
+    rows = [
+        [InlineKeyboardButton(text=label, callback_data=f"re_deal:{city}:{deal}")]
+        for deal, label in REAL_ESTATE_DEAL_LABELS.items()
+    ]
+    rows.append([InlineKeyboardButton(text="◀️ Назад", callback_data="re_menu")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def real_estate_sort_kb(city: str, deal: str) -> InlineKeyboardMarkup:
+    rows = [
+        [InlineKeyboardButton(text=label, callback_data=f"re_sort:{city}:{deal}:{sort}")]
+        for sort, label in REAL_ESTATE_SORT_LABELS.items()
+    ]
+    rows.append([InlineKeyboardButton(text="◀️ Назад", callback_data=f"re_city:{city}")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 # --- News formatting ---
@@ -263,7 +316,8 @@ WELCOME_TEXT = (
     "📋 <b>Сводка</b> — ежедневная подборка новостей о Сербии\n"
     "📰 <b>Новости</b> — последние новости из базы\n"
     "📊 <b>Статус</b> — проверить, работает ли бот\n"
-    "❓ <b>Помощь</b> — справка по всем функциям\n\n"
+    "❓ <b>Помощь</b> — справка по всем функциям\n"
+    "🏠 <b>Недвижимость</b> — подбор объявлений по городу, типу сделки и сортировке\n\n"
     "💬 Просто напишите текст — и я отвечу с помощью ИИ!\n\n"
     "🕐 Сводка приходит автоматически в <b>10:00</b> и <b>18:00</b> МСК\n\n"
     "⚠️ Использую только свежую информацию"
@@ -295,6 +349,7 @@ async def cmd_help(message: Message) -> None:
         "📰 /news — последние новости из базы\n"
         "📊 /status — статус бота и статистика\n"
         "🗑️ /clear — очистить историю диалога\n"
+        "🏠 Недвижимость — подбор объявлений по городу и фильтрам (кнопка в меню)\n"
         "💬 Задать вопрос — отвечу о релокации в Сербию\n\n"
         "<b>Примеры вопросов:</b>\n"
         "• Как получить ВНЖ в Сербии?\n"
@@ -397,6 +452,7 @@ async def cb_help(callback: CallbackQuery) -> None:
         "📋 <b>Сводка</b> — ежедневная подборка новостей о Сербии\n"
         "📰 <b>Новости</b> — последние новости из базы\n"
         "📊 <b>Статус</b> — статус бота и статистика\n"
+        "🏠 <b>Недвижимость</b> — подбор объявлений по городу и фильтрам\n"
         "💬 <b>Вопрос</b> — просто напишите текст и получите ответ от ИИ\n\n"
         "<b>Примеры вопросов:</b>\n"
         "• Как получить ВНЖ в Сербии?\n"
@@ -474,6 +530,99 @@ async def cb_digest(callback: CallbackQuery) -> None:
     )
 
 
+# --- Real estate menu callbacks ---
+
+async def _send_real_estate_listing(message: Message, row: dict, idx: int) -> None:
+    """Send one listing as a photo (with a text fallback if the photo fails)."""
+    caption = (
+        f"<b>📌 {idx}. {row['title']}</b>\n"
+        f"💰 Цена: {row['price'] or 'не указана'}\n"
+        f"📍 {row['location'] or 'не указано'}\n"
+        f'🔗 <a href="{row["url"]}">Подробнее</a>'
+    )
+    if row["image_url"]:
+        try:
+            photo = URLInputFile(row["image_url"])
+            await message.answer_photo(photo=photo, caption=caption, parse_mode="HTML")
+            return
+        except Exception as exc:
+            logger.warning("Failed to send real estate photo: %s", exc)
+    await message.answer(caption, parse_mode="HTML", disable_web_page_preview=True)
+
+
+@dp.callback_query(F.data == "re_menu")
+async def cb_real_estate_menu(callback: CallbackQuery) -> None:
+    await callback.message.edit_text(
+        "🏠 <b>Недвижимость в Сербии</b>\n\nВыберите город:",
+        parse_mode="HTML",
+        reply_markup=real_estate_city_kb(),
+    )
+    await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("re_city:"))
+async def cb_real_estate_city(callback: CallbackQuery) -> None:
+    city = callback.data.split(":", 1)[1]
+    label = REAL_ESTATE_CITY_LABELS.get(city, city)
+    await callback.message.edit_text(
+        f"🏠 <b>Недвижимость — {label}</b>\n\nЧто вас интересует?",
+        parse_mode="HTML",
+        reply_markup=real_estate_deal_kb(city),
+    )
+    await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("re_deal:"))
+async def cb_real_estate_deal(callback: CallbackQuery) -> None:
+    _, city, deal = callback.data.split(":", 2)
+    city_label = REAL_ESTATE_CITY_LABELS.get(city, city)
+    deal_label = REAL_ESTATE_DEAL_LABELS.get(deal, deal)
+    await callback.message.edit_text(
+        f"🏠 <b>{city_label} — {deal_label}</b>\n\nКак отсортировать?",
+        parse_mode="HTML",
+        reply_markup=real_estate_sort_kb(city, deal),
+    )
+    await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("re_sort:"))
+async def cb_real_estate_sort(callback: CallbackQuery) -> None:
+    _, city, deal, sort = callback.data.split(":", 3)
+    await callback.answer()
+
+    city_label = REAL_ESTATE_CITY_LABELS.get(city, city)
+    deal_label = REAL_ESTATE_DEAL_LABELS.get(deal, deal)
+    sort_label = REAL_ESTATE_SORT_LABELS.get(sort, sort)
+
+    rows = await database.get_real_estate_listings_filtered(
+        city=city, deal_type=deal, sort=sort, limit=10,
+    )
+
+    if not rows:
+        await callback.message.edit_text(
+            f"🏠 <b>{city_label} — {deal_label}</b>\n\n"
+            "📭 Пока нет собранных объявлений под эти фильтры — сборщик "
+            "обновляет базу каждые 6 часов. Попробуйте другой город или "
+            "тип сделки.",
+            parse_mode="HTML",
+            reply_markup=real_estate_deal_kb(city),
+        )
+        return
+
+    await callback.message.edit_text(
+        f"🏠 <b>{city_label} — {deal_label}</b>\n{sort_label}\n\nНайдено: {len(rows)}",
+        parse_mode="HTML",
+    )
+
+    for i, row in enumerate(rows, 1):
+        await _send_real_estate_listing(callback.message, row, i)
+
+    await callback.message.answer(
+        "Изменить сортировку/фильтры:",
+        reply_markup=real_estate_sort_kb(city, deal),
+    )
+
+
 # --- Text message handler (GigaChat) ---
 
 @dp.message(F.text)
@@ -527,7 +676,6 @@ async def handle_question(message: Message) -> None:
 
                     if listing.image_url:
                         try:
-                            from aiogram.types import URLInputFile
                             photo = URLInputFile(listing.image_url)
                             await message.answer_photo(
                                 photo=photo,

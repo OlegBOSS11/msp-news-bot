@@ -49,10 +49,14 @@ REAL_ESTATE_SOURCES = [
 # Kept short and polite (small number of pages, delay between requests) —
 # this runs unattended every few hours, not on every user request.
 HALOOGLASI_CITIES = ["beograd", "novi-sad", "nis", "kragujevac"]
+# (URL path segment, our internal deal_type value)
+HALOOGLASI_DEALS = [("prodaja", "sale"), ("izdavanje", "rent")]
+# Each entry: (url, city slug, deal_type) — city/deal_type aren't tagged on
+# individual cards by the site, so we derive them from which URL we fetched.
 HALOOGLASI_COLLECTOR_URLS = [
-    f"https://www.halooglasi.com/nekretnine/{deal}-stanova/{city}"
+    (f"https://www.halooglasi.com/nekretnine/{slug}-stanova/{city}", city, deal_type)
     for city in HALOOGLASI_CITIES
-    for deal in ("prodaja", "izdavanje")
+    for slug, deal_type in HALOOGLASI_DEALS
 ]
 
 
@@ -66,6 +70,9 @@ class PropertyListing:
     source: str = ""
     image_url: str | None = None
     ad_id: str = ""  # stable per-site ad ID, used as the DB primary key
+    city: str = ""  # HALOOGLASI_CITIES slug, e.g. "beograd"
+    deal_type: str = ""  # "sale" or "rent"
+    price_value: int | None = None  # comparable numeric price (EUR), for sorting
 
 
 async def fetch_page(url: str, timeout: int = 10) -> str | None:
@@ -147,7 +154,22 @@ def parse_nekretnine(html: str, base_url: str) -> list[PropertyListing]:
     return listings
 
 
-def parse_halooglasi(html: str, base_url: str) -> list[PropertyListing]:
+def _parse_price_value(raw: str) -> int | None:
+    """Extract a comparable integer EUR amount, e.g. '199.800' -> 199800.
+
+    Serbian sites format prices with '.' as the thousands separator.
+    Returns None for non-numeric prices (e.g. "Cena na upit" / "on request").
+    """
+    digits = re.sub(r"[^\d]", "", raw or "")
+    return int(digits) if digits else None
+
+
+def parse_halooglasi(
+    html: str,
+    base_url: str,
+    city: str = "",
+    deal_type: str = "",
+) -> list[PropertyListing]:
     """Parse listings from halooglasi.com.
 
     Selectors confirmed against the live site in August 2026 — each result
@@ -164,6 +186,13 @@ def parse_halooglasi(html: str, base_url: str) -> list[PropertyListing]:
           <ul class="subtitle-places"><li>Beograd</li>...</ul>
           <a class="a-images" href="..."><img src="https://img..."/></a>
         </div>
+
+    Args:
+        city: HALOOGLASI_CITIES slug this page was fetched for (e.g.
+            "beograd") — the site doesn't tag individual cards with it,
+            but every card on a per-city URL belongs to that city.
+        deal_type: "sale" or "rent" — likewise derived from which URL
+            (prodaja-stanova vs izdavanje-stanova) was fetched.
     """
     listings = []
     try:
@@ -182,6 +211,8 @@ def parse_halooglasi(html: str, base_url: str) -> list[PropertyListing]:
 
             price_el = card.select_one(".central-feature")
             price = price_el.get_text(strip=True) if price_el else None
+            value_el = card.select_one(".central-feature span[data-value]")
+            price_value = _parse_price_value(value_el.get("data-value", "")) if value_el else None
 
             location_parts = [
                 li.get_text(strip=True) for li in card.select(".subtitle-places li")
@@ -201,6 +232,9 @@ def parse_halooglasi(html: str, base_url: str) -> list[PropertyListing]:
                 location=location,
                 source="HaloOglasi",
                 image_url=image_url,
+                city=city,
+                deal_type=deal_type,
+                price_value=price_value,
             ))
     except Exception as exc:
         logger.error("Error parsing halooglasi.com: %s", exc)
@@ -359,10 +393,12 @@ async def collect_halooglasi_listings() -> list[PropertyListing]:
     meant to be called on a schedule (see bot.py), not per user message.
     """
     all_listings: list[PropertyListing] = []
-    for url in HALOOGLASI_COLLECTOR_URLS:
+    for url, city, deal_type in HALOOGLASI_COLLECTOR_URLS:
         html = await asyncio.to_thread(_fetch_page_sync, url, 15)
         if html:
-            all_listings.extend(parse_halooglasi(html, "https://www.halooglasi.com"))
+            all_listings.extend(
+                parse_halooglasi(html, "https://www.halooglasi.com", city=city, deal_type=deal_type)
+            )
         await asyncio.sleep(3)  # be polite between requests
     return all_listings
 
@@ -392,6 +428,9 @@ async def refresh_real_estate_database() -> int:
             url=listing.url,
             image_url=listing.image_url,
             source=listing.source,
+            city=listing.city,
+            deal_type=listing.deal_type,
+            price_value=listing.price_value,
         )
 
     await database.prune_stale_listings(days=7)

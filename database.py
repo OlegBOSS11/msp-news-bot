@@ -60,6 +60,21 @@ async def init_db() -> None:
             )
             """
         )
+        # Migration: city / deal_type / price_value were added later, for
+        # the real-estate menu's filter+sort feature. ALTER TABLE ADD
+        # COLUMN is not naturally idempotent in SQLite, so on a database
+        # that already has these columns (i.e. every run after the first)
+        # each statement below just fails with "duplicate column name" —
+        # caught and ignored.
+        for ddl in (
+            "ALTER TABLE real_estate_listings ADD COLUMN city TEXT",
+            "ALTER TABLE real_estate_listings ADD COLUMN deal_type TEXT",
+            "ALTER TABLE real_estate_listings ADD COLUMN price_value INTEGER",
+        ):
+            try:
+                await db.execute(ddl)
+            except Exception:
+                pass  # column already exists
         await db.commit()
 
 
@@ -226,6 +241,9 @@ async def upsert_real_estate_listing(
     url: str,
     image_url: str | None,
     source: str,
+    city: str | None = None,
+    deal_type: str | None = None,
+    price_value: int | None = None,
 ) -> None:
     """Insert a listing, or refresh it (and bump last_seen) if already known."""
     try:
@@ -233,8 +251,9 @@ async def upsert_real_estate_listing(
             await db.execute(
                 """
                 INSERT INTO real_estate_listings
-                    (ad_id, title, price, location, url, image_url, source, last_seen)
-                VALUES (?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+                    (ad_id, title, price, location, url, image_url, source,
+                     city, deal_type, price_value, last_seen)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
                 ON CONFLICT(ad_id) DO UPDATE SET
                     title=excluded.title,
                     price=excluded.price,
@@ -242,9 +261,13 @@ async def upsert_real_estate_listing(
                     url=excluded.url,
                     image_url=excluded.image_url,
                     source=excluded.source,
+                    city=excluded.city,
+                    deal_type=excluded.deal_type,
+                    price_value=excluded.price_value,
                     last_seen=CURRENT_TIMESTAMP
                 """,
-                (ad_id, title, price, location, url, image_url, source),
+                (ad_id, title, price, location, url, image_url, source,
+                 city, deal_type, price_value),
             )
             await db.commit()
     except Exception as exc:
@@ -269,6 +292,58 @@ async def get_real_estate_listings(limit: int = 100) -> list[dict]:
             return [dict(row) for row in rows]
     except Exception as exc:
         logger.error("DB get_real_estate_listings error: %s", exc)
+        return []
+
+
+async def get_real_estate_listings_filtered(
+    city: str | None = None,
+    deal_type: str | None = None,
+    sort: str = "newest",
+    limit: int = 10,
+) -> list[dict]:
+    """Return listings for the real-estate menu, filtered and sorted.
+
+    Args:
+        city: HALOOGLASI_CITIES slug (e.g. "beograd"), or None for all cities.
+        deal_type: "sale" or "rent", or None for both.
+        sort: "newest" | "oldest" | "price_asc" | "price_desc".
+    """
+    order_by = {
+        "newest": "first_seen DESC",
+        "oldest": "first_seen ASC",
+        "price_asc": "price_value IS NULL, price_value ASC",
+        "price_desc": "price_value IS NULL, price_value DESC",
+    }.get(sort, "first_seen DESC")
+
+    conditions = []
+    params: list = []
+    if city:
+        conditions.append("city = ?")
+        params.append(city)
+    if deal_type:
+        conditions.append("deal_type = ?")
+        params.append(deal_type)
+    where_clause = f"WHERE {' AND '.join(conditions)}" if conditions else ""
+    params.append(limit)
+
+    try:
+        async with aiosqlite.connect(DB_PATH) as db:
+            db.row_factory = aiosqlite.Row
+            cursor = await db.execute(
+                f"""
+                SELECT ad_id, title, price, location, url, image_url, source,
+                       city, deal_type, price_value
+                FROM real_estate_listings
+                {where_clause}
+                ORDER BY {order_by}
+                LIMIT ?
+                """,
+                params,
+            )
+            rows = await cursor.fetchall()
+            return [dict(row) for row in rows]
+    except Exception as exc:
+        logger.error("DB get_real_estate_listings_filtered error: %s", exc)
         return []
 
 
