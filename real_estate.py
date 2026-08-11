@@ -10,6 +10,7 @@ from dataclasses import dataclass
 from urllib.parse import urljoin
 
 import aiohttp
+import requests
 from bs4 import BeautifulSoup
 
 import database
@@ -82,6 +83,31 @@ async def fetch_page(url: str, timeout: int = 10) -> str | None:
                 if resp.status == 200:
                     return await resp.text()
                 logger.warning("Failed to fetch %s: HTTP %d", url, resp.status)
+    except Exception as exc:
+        logger.error("Error fetching %s: %s", url, exc)
+    return None
+
+
+def _fetch_page_sync(url: str, timeout: int = 15) -> str | None:
+    """Blocking HTTP GET via `requests`, for hosts that block aiohttp.
+
+    Confirmed empirically against halooglasi.com: identical User-Agent and
+    target URL, but `requests` gets a clean 200 while `aiohttp` gets a
+    blocked/malformed response — almost certainly Cloudflare bot-scoring
+    based on TLS/HTTP-stack fingerprint rather than headers. Run through
+    asyncio.to_thread() so this blocking call doesn't stall the event loop.
+    """
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+            "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+        ),
+    }
+    try:
+        resp = requests.get(url, headers=headers, timeout=timeout)
+        if resp.status_code == 200:
+            return resp.text
+        logger.warning("Failed to fetch %s: HTTP %d", url, resp.status_code)
     except Exception as exc:
         logger.error("Error fetching %s: %s", url, exc)
     return None
@@ -332,7 +358,7 @@ async def collect_halooglasi_listings() -> list[PropertyListing]:
     """
     all_listings: list[PropertyListing] = []
     for url in HALOOGLASI_COLLECTOR_URLS:
-        html = await fetch_page(url, timeout=15)
+        html = await asyncio.to_thread(_fetch_page_sync, url, 15)
         if html:
             all_listings.extend(parse_halooglasi(html, "https://www.halooglasi.com"))
         await asyncio.sleep(3)  # be polite between requests
