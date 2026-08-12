@@ -3,10 +3,12 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import socket
 import tempfile
 from datetime import datetime, timedelta, timezone
 
 from aiogram import Bot, Dispatcher, F
+from aiogram.client.session.aiohttp import AiohttpSession
 from aiogram.filters import CommandStart, Command
 from aiogram.types import (
     Message,
@@ -44,7 +46,15 @@ logger = logging.getLogger(__name__)
 
 MOSCOW_TZ = timezone(timedelta(hours=3))
 
-bot = Bot(token=config.BOT_TOKEN)
+# Force IPv4: this VDS has no IPv6 route at all, and aiogram's default
+# aiohttp connector may otherwise try IPv6 first and stall/fail before
+# falling back. Same fix already applied to aiohttp usage in parser.py,
+# real_estate.py and serbia_search.py — this covers the Bot API session
+# itself (getUpdates/sendMessage/etc.), which was the one gap left.
+_bot_session = AiohttpSession()
+_bot_session._connector_init["family"] = socket.AF_INET
+
+bot = Bot(token=config.BOT_TOKEN, session=_bot_session)
 dp = Dispatcher()
 
 # Get current date for system prompt
