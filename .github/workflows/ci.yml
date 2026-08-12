@@ -1,0 +1,41 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.14"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          # See CONTRIBUTING.md / DEPLOY.md — sgmllib3k (feedparser dep)
+          # needs an older setuptools + no build isolation on newer pip.
+          pip install "setuptools==68.2.2" wheel
+          pip install --no-build-isolation -r requirements.txt
+          pip install --no-build-isolation -r requirements-dev.txt
+          pip install ruff
+
+      - name: Lint (ruff check)
+        run: ruff check .
+
+      # ruff format --check is intentionally not run yet — the existing
+      # codebase predates ruff and needs one dedicated reformatting pass
+      # (see DEPLOY.md/CONTRIBUTING.md history) rather than folding it
+      # silently into an unrelated change.
+
+      - name: Run tests
+        env:
+          BOT_TOKEN: "123456:test-token"
+          CHAT_ID: "123456"
+          GIGACHAT_CREDENTIALS: "test:cred"
+        run: python -m pytest -v

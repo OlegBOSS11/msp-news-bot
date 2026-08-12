@@ -21,6 +21,7 @@ from aiogram.types import (
 )
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
+from apscheduler.triggers.date import DateTrigger
 from apscheduler.triggers.interval import IntervalTrigger
 from gigachat.models.chat import Chat, Messages
 import speech_recognition as sr
@@ -31,11 +32,11 @@ from gigachat_client import get_gigachat_client
 from parser import collect_news
 from real_estate import (
     search_real_estate_with_fallback,
-    format_listings,
     is_real_estate_query,
     refresh_real_estate_database,
 )
 from serbia_search import get_serbia_answer
+from telegram_format import telegram_link, telegram_text
 from translator import translate_to_russian, detect_language
 
 logging.basicConfig(
@@ -225,22 +226,20 @@ def _categorize_item(title: str, summary: str) -> set[str]:
 
 
 async def _collect_fresh_news() -> list[dict]:
-    """Collect today's news, filtered to items not yet sent to the broadcast channel."""
+    """Collect today's relevant news.
+
+    collect_news() already limits results to the last 24h. This used to
+    also drop anything in the global `sent_news` log, but that made
+    delivery depend on whether *anyone* had ever been sent an item before —
+    a user whose send failed, or who subscribed after another user already
+    got it, would never see it. Delivery tracking is per-user now (see
+    database.get_user_sent_links/mark_user_sent), so this is unfiltered.
+    """
     try:
-        news = await collect_news()
+        return await collect_news()
     except Exception as exc:
         logger.error("Failed to collect news: %s", exc, exc_info=True)
         return []
-
-    fresh: list[dict] = []
-    for item in news:
-        try:
-            if not await database.is_sent(item["link"]):
-                fresh.append(item)
-        except Exception as exc:
-            logger.warning("DB check failed for %s: %s", item["link"], exc)
-            fresh.append(item)
-    return fresh
 
 
 async def _prepare_digest_items(fresh: list[dict]) -> list[dict]:
@@ -283,11 +282,18 @@ def _digest_header_text(count: int) -> str:
 
 def _digest_item_caption(idx: int, item: dict) -> str:
     """Caption for one digest item, trimmed to fit Telegram's 1024-char
-    photo caption limit (only summary gets shortened, never the markup)."""
-    header = f"<b>📌 {idx}. {item['title']}</b>\n<i>Источник: {item['source']}</i>\n"
-    footer = f'\n🔗 <a href="{item["link"]}">Читать далее</a>'
+    photo caption limit (only summary gets shortened, never the markup).
+
+    title/source/summary come from RSS feeds and link from the feed's own
+    <link> — all external input, escaped before going into an HTML message.
+    """
+    title = telegram_text(item["title"])
+    source = telegram_text(item["source"])
+    link = telegram_link(item["link"], "Читать далее")
+    header = f"<b>📌 {idx}. {title}</b>\n<i>Источник: {source}</i>\n"
+    footer = f"\n🔗 {link}"
     budget = 1024 - len(header) - len(footer) - 1
-    summary = item["summary"]
+    summary = telegram_text(item["summary"])
     if budget <= 0:
         summary = ""
     elif len(summary) > budget:
@@ -295,55 +301,81 @@ def _digest_item_caption(idx: int, item: dict) -> str:
     return header + summary + footer
 
 
-async def _send_digest_item(chat_id: int, idx: int, item: dict) -> None:
-    """Send one digest item — as a photo if it has an image, else plain text."""
+async def _send_digest_item(chat_id: int, idx: int, item: dict) -> bool:
+    """Send one digest item — as a photo if it has an image, else plain text.
+
+    Returns True only if the item actually reached the user — the caller
+    uses this to decide whether to record it as delivered.
+    """
     caption = _digest_item_caption(idx, item)
     if item.get("image_url"):
         try:
             photo = URLInputFile(item["image_url"])
             await bot.send_photo(chat_id=chat_id, photo=photo, caption=caption, parse_mode="HTML")
-            return
+            return True
         except Exception as exc:
             logger.warning("Failed to send digest photo to %s: %s", chat_id, exc)
+            # Fall through to the text-only retry below.
     try:
         await bot.send_message(
             chat_id=chat_id, text=caption, parse_mode="HTML", disable_web_page_preview=True,
         )
+        return True
     except Exception as exc:
         logger.error("Failed to send digest item to %s: %s", chat_id, exc)
+        return False
 
 
-async def _send_personalized_digest(chat_id: int, user_id: int, items: list[dict]) -> bool:
+async def _send_personalized_digest(
+    chat_id: int, user_id: int, items: list[dict], record_sent: bool,
+) -> bool:
     """Send only the items matching this user's enabled topics.
+
+    record_sent=True (scheduled broadcast): items this user already has
+    (database.get_user_sent_links) are skipped, and each item is recorded
+    as delivered only after it's actually sent successfully — a failed
+    send or a Telegram outage no longer loses the item for that user, it's
+    just retried at the next scheduled run.
+
+    record_sent=False (on-demand /digest): no history is consulted or
+    written — it's a live snapshot, not a delivery channel, and must not
+    affect what the scheduled broadcast later sends.
 
     Returns True if anything was actually sent.
     """
     disabled = await database.get_disabled_topics(user_id)
-    user_items = [it for it in items if it["categories"] - disabled]
-    if not user_items:
+    candidates = [it for it in items if it["categories"] - disabled]
+
+    if record_sent:
+        already_sent = await database.get_user_sent_links(user_id)
+        candidates = [it for it in candidates if it["link"] not in already_sent]
+
+    if not candidates:
         return False
 
     try:
         await bot.send_message(
-            chat_id=chat_id, text=_digest_header_text(len(user_items)),
+            chat_id=chat_id, text=_digest_header_text(len(candidates)),
             parse_mode="HTML", disable_web_page_preview=True,
         )
     except Exception as exc:
         logger.error("Failed to send digest header to %s: %s", chat_id, exc)
         return False
 
-    for i, item in enumerate(user_items, 1):
-        await _send_digest_item(chat_id, i, item)
+    for i, item in enumerate(candidates, 1):
+        ok = await _send_digest_item(chat_id, i, item)
+        if ok and record_sent:
+            await database.mark_user_sent(user_id, item["link"])
 
     return True
 
 
 async def send_daily_digest() -> None:
     """Broadcast the scheduled digest to every user who has started the bot,
-    personalized per user by their enabled news topics.
+    personalized per user by their enabled news topics and by what they've
+    already been sent (database.user_sent_news).
 
-    Called only by the 10:00/18:00 scheduler jobs. Marks sent items so the
-    same story is never broadcast twice.
+    Called only by the 10:00/18:00 scheduler jobs.
     """
     logger.info("Starting daily digest collection...")
     fresh = await _collect_fresh_news()
@@ -353,20 +385,24 @@ async def send_daily_digest() -> None:
 
     items = await _prepare_digest_items(fresh)
 
-    user_ids = await database.get_all_user_ids()
-    if not user_ids:
-        logger.warning("No subscribed users found — digest was not sent to anyone.")
-    sent_count = 0
-    for user_id in user_ids:
-        if await _send_personalized_digest(user_id, user_id, items):
-            sent_count += 1
-        await asyncio.sleep(0.05)  # stay well under Telegram's rate limits
-
+    # Record-keeping for /news and /status — not used to gate delivery
+    # anymore (see _collect_fresh_news / _send_personalized_digest).
     for item in fresh:
         try:
             await database.mark_sent(item["link"], item["title"])
         except Exception as exc:
             logger.warning("DB mark_sent failed: %s", exc)
+
+    await database.prune_old_user_sent_news(days=3)
+
+    user_ids = await database.get_all_user_ids()
+    if not user_ids:
+        logger.warning("No subscribed users found — digest was not sent to anyone.")
+    sent_count = 0
+    for user_id in user_ids:
+        if await _send_personalized_digest(user_id, user_id, items, record_sent=True):
+            sent_count += 1
+        await asyncio.sleep(0.05)  # stay well under Telegram's rate limits
 
     logger.info("Digest sent to %d/%d subscribers (%d items collected).", sent_count, len(user_ids), len(fresh))
 
@@ -374,9 +410,10 @@ async def send_daily_digest() -> None:
 async def send_personal_digest(chat_id: int) -> bool:
     """Send an on-demand digest to a single chat (used by /digest and the button).
 
-    Unlike send_daily_digest(), this does NOT call database.mark_sent() —
-    it's a personal, on-demand view, so it must not suppress the scheduled
-    broadcast from later reaching every subscribed user.
+    This is a live snapshot of the last 24h of relevant news, personalized
+    only by topic — it doesn't consult or write per-user delivery history,
+    so it neither hides items the scheduled broadcast hasn't sent yet nor
+    suppresses the scheduled broadcast from later reaching every subscriber.
 
     Returns True if a digest was actually sent, False if there was nothing new
     (either no fresh news at all, or none matched this user's enabled topics).
@@ -388,7 +425,7 @@ async def send_personal_digest(chat_id: int) -> bool:
 
     items = await _prepare_digest_items(fresh)
     # Private chats: chat_id == user_id, safe to reuse for topic lookup.
-    return await _send_personalized_digest(chat_id, chat_id, items)
+    return await _send_personalized_digest(chat_id, chat_id, items, record_sent=False)
 
 
 # --- Welcome message ---
@@ -504,7 +541,7 @@ async def cmd_news(message: Message) -> None:
             if lang == "serbian":
                 title = await translate_to_russian(title)
 
-        lines.append(f'{i}. <a href="{link}">{title}</a>')
+        lines.append(f"{i}. {telegram_link(link, title)}")
 
     await message.answer(
         "\n".join(lines),
@@ -598,7 +635,7 @@ async def cb_news(callback: CallbackQuery) -> None:
             if lang == "serbian":
                 title = await translate_to_russian(title)
 
-        lines.append(f'{i}. <a href="{link}">{title}</a>')
+        lines.append(f"{i}. {telegram_link(link, title)}")
 
     await callback.message.edit_text(
         "\n".join(lines),
@@ -623,12 +660,20 @@ async def cb_digest(callback: CallbackQuery) -> None:
 # --- Real estate menu callbacks ---
 
 async def _send_real_estate_listing(message: Message, row: dict, idx: int) -> None:
-    """Send one listing as a photo (with a text fallback if the photo fails)."""
+    """Send one listing as a photo (with a text fallback if the photo fails).
+
+    All fields come from scraped listing pages (real_estate_listings table)
+    — external input, escaped before going into an HTML message.
+    """
+    title = telegram_text(row["title"])
+    price = telegram_text(row["price"]) if row["price"] else "не указана"
+    location = telegram_text(row["location"]) if row["location"] else "не указано"
+    link = telegram_link(row["url"], "Подробнее")
     caption = (
-        f"<b>📌 {idx}. {row['title']}</b>\n"
-        f"💰 Цена: {row['price'] or 'не указана'}\n"
-        f"📍 {row['location'] or 'не указано'}\n"
-        f'🔗 <a href="{row["url"]}">Подробнее</a>'
+        f"<b>📌 {idx}. {title}</b>\n"
+        f"💰 Цена: {price}\n"
+        f"📍 {location}\n"
+        f"🔗 {link}"
     )
     if row["image_url"]:
         try:
@@ -653,7 +698,10 @@ async def cb_real_estate_menu(callback: CallbackQuery) -> None:
 @dp.callback_query(F.data.startswith("re_city:"))
 async def cb_real_estate_city(callback: CallbackQuery) -> None:
     city = callback.data.split(":", 1)[1]
-    label = REAL_ESTATE_CITY_LABELS.get(city, city)
+    # .get(..., city) falls back to the raw callback_data value, which is
+    # technically attacker-controllable (Telegram doesn't cryptographically
+    # bind callback_data to an actual button press) — escape the fallback.
+    label = REAL_ESTATE_CITY_LABELS.get(city, telegram_text(city))
     await callback.message.edit_text(
         f"🏠 <b>Недвижимость — {label}</b>\n\nЧто вас интересует?",
         parse_mode="HTML",
@@ -665,8 +713,8 @@ async def cb_real_estate_city(callback: CallbackQuery) -> None:
 @dp.callback_query(F.data.startswith("re_deal:"))
 async def cb_real_estate_deal(callback: CallbackQuery) -> None:
     _, city, deal = callback.data.split(":", 2)
-    city_label = REAL_ESTATE_CITY_LABELS.get(city, city)
-    deal_label = REAL_ESTATE_DEAL_LABELS.get(deal, deal)
+    city_label = REAL_ESTATE_CITY_LABELS.get(city, telegram_text(city))
+    deal_label = REAL_ESTATE_DEAL_LABELS.get(deal, telegram_text(deal))
     await callback.message.edit_text(
         f"🏠 <b>{city_label} — {deal_label}</b>\n\nКак отсортировать?",
         parse_mode="HTML",
@@ -680,9 +728,9 @@ async def cb_real_estate_sort(callback: CallbackQuery) -> None:
     _, city, deal, sort = callback.data.split(":", 3)
     await callback.answer()
 
-    city_label = REAL_ESTATE_CITY_LABELS.get(city, city)
-    deal_label = REAL_ESTATE_DEAL_LABELS.get(deal, deal)
-    sort_label = REAL_ESTATE_SORT_LABELS.get(sort, sort)
+    city_label = REAL_ESTATE_CITY_LABELS.get(city, telegram_text(city))
+    deal_label = REAL_ESTATE_DEAL_LABELS.get(deal, telegram_text(deal))
+    sort_label = REAL_ESTATE_SORT_LABELS.get(sort, telegram_text(sort))
 
     rows = await database.get_real_estate_listings_filtered(
         city=city, deal_type=deal, sort=sort, limit=10,
@@ -789,12 +837,14 @@ async def handle_question(message: Message) -> None:
 
                 # Send first listing with photo if available
                 for i, listing in enumerate(listings[:5]):
+                    price = telegram_text(listing.price) if listing.price else "не указана"
+                    location = telegram_text(listing.location) if listing.location else "не указана"
                     caption = (
-                        f"<b>📌 {i+1}. {listing.title}</b>\n"
-                        f"💰 Цена: {listing.price or 'не указана'}\n"
-                        f"📍 Локация: {listing.location or 'не указана'}\n"
-                        f"🌐 Источник: {listing.source}\n"
-                        f'🔗 <a href="{listing.url}">Подробнее</a>'
+                        f"<b>📌 {i+1}. {telegram_text(listing.title)}</b>\n"
+                        f"💰 Цена: {price}\n"
+                        f"📍 Локация: {location}\n"
+                        f"🌐 Источник: {telegram_text(listing.source)}\n"
+                        f"🔗 {telegram_link(listing.url, 'Подробнее')}"
                     )
 
                     if listing.image_url:
@@ -853,14 +903,16 @@ async def handle_question(message: Message) -> None:
                 answer = "⚠️ Ошибка при поиске информации. Попробуйте позже."
         else:
             # Use GigaChat for other questions (without web search)
-            # Get conversation history for context
+            # Get conversation history for context. save_message(user_id,
+            # "user", user_text) already ran above (top of this handler),
+            # so `history`'s last entry IS this question — do not append
+            # user_text again here, or the model sees it twice.
             history = await database.get_conversation_history(user_id, limit=10)
 
             # Build messages with history
             messages = [Messages(role="system", content=get_system_prompt())]
             for msg in history:
                 messages.append(Messages(role=msg["role"], content=msg["content"]))
-            messages.append(Messages(role="user", content=user_text))
 
             try:
                 giga = get_gigachat_client()
@@ -868,7 +920,9 @@ async def handle_question(message: Message) -> None:
                     raise Exception("GigaChat client not available")
                 chat = Chat(model="GigaChat", messages=messages)
                 response = await giga.achat(chat)
-                answer = response.choices[0].message.content
+                # Free-form model output — escape before it goes into the
+                # HTML-parse-mode message sent below.
+                answer = telegram_text(response.choices[0].message.content)
             except Exception as exc:
                 logger.error("GigaChat error: %s", exc)
                 answer = "⚠️ Ошибка при обращении к ИИ. Попробуйте позже."
@@ -892,13 +946,21 @@ async def transcribe_voice(voice_file_id: str) -> str | None:
             ogg_path = tmp.name
 
         wav_path = ogg_path.replace(".ogg", ".wav")
-        # Use async subprocess to avoid blocking the event loop
+        # Use async subprocess to avoid blocking the event loop. A hung
+        # ffmpeg process (corrupt input, stalled I/O) must not hang the
+        # handler forever — bound it with a timeout.
         proc = await asyncio.create_subprocess_exec(
             "ffmpeg", "-y", "-i", ogg_path, "-ar", "16000", "-ac", "1", wav_path,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
-        await proc.communicate()
+        try:
+            await asyncio.wait_for(proc.communicate(), timeout=30)
+        except asyncio.TimeoutError:
+            logger.error("ffmpeg conversion timed out")
+            proc.kill()
+            await proc.wait()
+            return None
         if proc.returncode != 0:
             logger.error("ffmpeg conversion failed with code %d", proc.returncode)
             return None
@@ -907,7 +969,11 @@ async def transcribe_voice(voice_file_id: str) -> str | None:
         with sr.AudioFile(wav_path) as source:
             audio = recognizer.record(source)
 
-        text = recognizer.recognize_google(audio, language="ru-RU")
+        # recognize_google() makes a blocking network call — run it off
+        # the event loop so one slow/stuck transcription doesn't stall
+        # everything else sharing this loop (polling, other users,
+        # scheduled jobs).
+        text = await asyncio.to_thread(recognizer.recognize_google, audio, language="ru-RU")
         return text
     except sr.UnknownValueError:
         return None
@@ -934,7 +1000,7 @@ async def handle_voice(message: Message) -> None:
         )
         return
 
-    await message.answer(f"🎤 <i>Вы сказали:</i> {text}", parse_mode="HTML")
+    await message.answer(f"🎤 <i>Вы сказали:</i> {telegram_text(text)}", parse_mode="HTML")
 
     user_id = message.from_user.id
 
@@ -968,6 +1034,24 @@ async def handle_voice(message: Message) -> None:
 
 # --- Main ---
 
+async def _initial_real_estate_collection() -> None:
+    """One-off startup job — see the DateTrigger job below for why this
+    isn't just awaited directly in main()."""
+    logger.info("Collecting real estate listings...")
+    try:
+        count = await refresh_real_estate_database()
+        logger.info("Real estate collector: %d listings on startup.", count)
+    except Exception as exc:
+        logger.error("Real estate collector failed on startup: %s", exc, exc_info=True)
+
+
+async def _initial_digest() -> None:
+    """One-off startup job — see the DateTrigger job below for why this
+    isn't just awaited directly in main()."""
+    logger.info("Sending initial digest now...")
+    await send_daily_digest()
+
+
 async def main() -> None:
     await database.init_db()
     logger.info("Database initialized.")
@@ -979,8 +1063,11 @@ async def main() -> None:
     # restart it, but there's no reason to pay that cost) — if this fails,
     # dp.start_polling() below will just hit TelegramConflictError and
     # retry with its own backoff, same as if no webhook was set at all.
+    #
+    # drop_pending_updates=False: a restart (deploy, crash, systemd bump)
+    # must not silently discard messages users sent while the bot was down.
     try:
-        await bot.delete_webhook(drop_pending_updates=True)
+        await bot.delete_webhook(drop_pending_updates=False)
     except Exception as exc:
         logger.warning("delete_webhook failed (will rely on polling's own retry): %s", exc)
 
@@ -1003,18 +1090,24 @@ async def main() -> None:
         id="real_estate_collector",
         replace_existing=True,
     )
+    # Startup work (scraping 8 real-estate pages, collecting/translating the
+    # digest) used to run inline here, before dp.start_polling() — in the
+    # worst case that left the bot not responding to anyone for minutes
+    # after process start. Scheduling both as one-off "run now" jobs lets
+    # them run concurrently with polling instead of blocking it.
+    now = datetime.now(MOSCOW_TZ)
+    scheduler.add_job(
+        _initial_real_estate_collection,
+        trigger=DateTrigger(run_date=now),
+        id="initial_real_estate_collection",
+    )
+    scheduler.add_job(
+        _initial_digest,
+        trigger=DateTrigger(run_date=now),
+        id="initial_digest",
+    )
     scheduler.start()
     logger.info("Scheduler started — next runs at 10:00 and 18:00 MSK.")
-
-    logger.info("Collecting real estate listings...")
-    try:
-        count = await refresh_real_estate_database()
-        logger.info("Real estate collector: %d listings on startup.", count)
-    except Exception as exc:
-        logger.error("Real estate collector failed on startup: %s", exc, exc_info=True)
-
-    logger.info("Sending initial digest now...")
-    await send_daily_digest()
 
     logger.info("Starting bot polling...")
     await dp.start_polling(bot)

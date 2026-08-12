@@ -201,32 +201,47 @@ class TestTelegramResilience:
             {"title": "News 2", "link": "https://test2.com",
              "summary": "Summary 2", "score": 1, "source": "test"},
         ]):
-            with patch("database.is_sent", return_value=False):
-                with patch("database.mark_sent", new_callable=AsyncMock):
-                    # Two subscribers, so the broadcast loop actually has
-                    # something to iterate over.
-                    with patch("database.get_all_user_ids", return_value=[111, 222]):
-                        with patch("database.get_disabled_topics", return_value=set()):
-                            call_count = 0
+            with patch("database.mark_sent", new_callable=AsyncMock):
+                # Two subscribers, so the broadcast loop actually has
+                # something to iterate over. Neither has been sent
+                # anything yet, and per-user delivery is not recorded
+                # here — this test only cares about broadcast resilience.
+                with patch("database.get_all_user_ids", return_value=[111, 222]):
+                    with patch("database.get_disabled_topics", return_value=set()):
+                        with patch("database.get_user_sent_links", return_value=set()):
+                            with patch("database.mark_user_sent", new_callable=AsyncMock):
+                                with patch("database.prune_old_user_sent_news", new_callable=AsyncMock):
+                                    call_count = 0
 
-                            async def failing_send(**kwargs):
-                                nonlocal call_count
-                                call_count += 1
-                                if call_count == 1:
-                                    raise Exception("Telegram API error")
+                                    async def failing_send(**kwargs):
+                                        nonlocal call_count
+                                        call_count += 1
+                                        if call_count == 1:
+                                            raise Exception("Telegram API error")
 
-                            with patch("bot.bot.send_message", side_effect=failing_send):
-                                # Should not crash. Subscriber 1's digest
-                                # header send fails (so nothing else goes
-                                # out to them), but subscriber 2 still gets
-                                # their full digest: 1 header + 1 message
-                                # per news item (2 items, no images in this
-                                # test) = 3 sends. Total = 1 + 3 = 4.
-                                await send_daily_digest()
-                                assert call_count == 4
+                                    with patch("bot.bot.send_message", side_effect=failing_send):
+                                        # Should not crash. Subscriber 1's digest
+                                        # header send fails (so nothing else goes
+                                        # out to them), but subscriber 2 still gets
+                                        # their full digest: 1 header + 1 message
+                                        # per news item (2 items, no images in this
+                                        # test) = 3 sends. Total = 1 + 3 = 4.
+                                        await send_daily_digest()
+                                        assert call_count == 4
 
 
 # --- Test 5: Voice transcription failures ---
+
+def _fake_ffmpeg_process(returncode: int = 0) -> MagicMock:
+    """A fake asyncio subprocess handle standing in for
+    asyncio.create_subprocess_exec("ffmpeg", ...)."""
+    proc = MagicMock()
+    proc.communicate = AsyncMock(return_value=(b"", b""))
+    proc.returncode = returncode
+    proc.wait = AsyncMock()
+    proc.kill = MagicMock()
+    return proc
+
 
 class TestVoiceResilience:
     """Test that bot survives voice transcription failures."""
@@ -242,13 +257,19 @@ class TestVoiceResilience:
 
     @pytest.mark.asyncio
     async def test_ffmpeg_not_installed(self):
-        """Bot should handle missing ffmpeg."""
+        """Bot should handle missing ffmpeg.
+
+        transcribe_voice() converts audio via asyncio.create_subprocess_exec
+        (not subprocess.run — patching that, as this test used to, mocks a
+        function the real code never calls, so ffmpeg would actually run
+        for real against a throwaway temp file underneath the test).
+        """
         from bot import transcribe_voice
 
         with patch("bot.bot.get_file") as mock_file:
             mock_file.return_value.file_path = "/voice/file.ogg"
             with patch("bot.bot.download_file", new_callable=AsyncMock):
-                with patch("subprocess.run", side_effect=FileNotFoundError):
+                with patch("asyncio.create_subprocess_exec", side_effect=FileNotFoundError):
                     result = await transcribe_voice("file_id")
                     assert result is None
 
@@ -261,11 +282,35 @@ class TestVoiceResilience:
         with patch("bot.bot.get_file") as mock_file:
             mock_file.return_value.file_path = "/voice/file.ogg"
             with patch("bot.bot.download_file", new_callable=AsyncMock):
-                with patch("subprocess.run"):
-                    with patch("speech_recognition.Recognizer") as mock_rec:
-                        mock_rec.return_value.recognize_google.side_effect = sr.UnknownValueError()
-                        result = await transcribe_voice("file_id")
-                        assert result is None
+                # A successful "conversion" so the code actually reaches
+                # the recognizer step below, rather than bailing out early
+                # on a real ffmpeg run against a fake/missing file.
+                with patch("asyncio.create_subprocess_exec", new=AsyncMock(return_value=_fake_ffmpeg_process(0))):
+                    with patch("speech_recognition.AudioFile"):
+                        with patch("speech_recognition.Recognizer") as mock_rec:
+                            mock_rec.return_value.recognize_google.side_effect = sr.UnknownValueError()
+                            result = await transcribe_voice("file_id")
+                            assert result is None
+                            mock_rec.return_value.recognize_google.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_ffmpeg_conversion_times_out(self):
+        """A hung ffmpeg process must be killed, not left to hang the handler."""
+        from bot import transcribe_voice
+
+        with patch("bot.bot.get_file") as mock_file:
+            mock_file.return_value.file_path = "/voice/file.ogg"
+            with patch("bot.bot.download_file", new_callable=AsyncMock):
+                proc = _fake_ffmpeg_process(0)
+                # asyncio.wait_for(proc.communicate(), ...) propagates
+                # whatever the wrapped awaitable raises — no need to patch
+                # wait_for itself, just make communicate() the thing that
+                # "times out".
+                proc.communicate = AsyncMock(side_effect=asyncio.TimeoutError())
+                with patch("asyncio.create_subprocess_exec", new=AsyncMock(return_value=proc)):
+                    result = await transcribe_voice("file_id")
+                    assert result is None
+                    proc.kill.assert_called_once()
 
 
 # --- Test 6: Scheduler resilience ---
@@ -285,6 +330,26 @@ class TestSchedulerResilience:
 
 # --- Test 7: Network timeout ---
 
+def _mock_get_raising(exc: Exception) -> MagicMock:
+    """A fake aiohttp ClientSession whose .get(...) — used as
+    `async with session.get(...) as resp:` — raises `exc` on __aenter__.
+
+    session.get(...) itself is a plain (sync) call that returns an async
+    context manager; the actual request happens in __aenter__. An
+    AsyncMock() with .get.side_effect set (the previous shape of these
+    tests) makes session.get(...) return a bare coroutine instead, which
+    `async with` can't use as a context manager at all — that TypeError
+    happened to also land in _fetch_feed's except Exception, so the test
+    passed without ever exercising real timeout/connection-error handling.
+    """
+    session = MagicMock()
+    ctx = MagicMock()
+    ctx.__aenter__ = AsyncMock(side_effect=exc)
+    ctx.__aexit__ = AsyncMock(return_value=False)
+    session.get.return_value = ctx
+    return session
+
+
 class TestNetworkResilience:
     """Test handling of network timeouts."""
 
@@ -293,9 +358,7 @@ class TestNetworkResilience:
         """Feed fetch should handle timeout."""
         from parser import _fetch_feed
 
-        mock_session = AsyncMock()
-        mock_session.get.side_effect = asyncio.TimeoutError()
-
+        mock_session = _mock_get_raising(asyncio.TimeoutError())
         result = await _fetch_feed(mock_session, {"name": "test", "url": "https://test"})
         assert result == []
 
@@ -304,11 +367,259 @@ class TestNetworkResilience:
         """Feed fetch should handle connection error."""
         from parser import _fetch_feed
 
-        mock_session = AsyncMock()
-        mock_session.get.side_effect = Exception("Connection refused")
-
+        mock_session = _mock_get_raising(Exception("Connection refused"))
         result = await _fetch_feed(mock_session, {"name": "test", "url": "https://test"})
         assert result == []
+
+
+# --- Test 8: Per-user digest delivery tracking ---
+
+class TestPerUserDigestDelivery:
+    """Regression tests for user_sent_news — delivery is tracked per user,
+    not globally, and only recorded after an actual successful send."""
+
+    @pytest.mark.asyncio
+    async def test_mark_and_get_user_sent_links(self, tmp_path):
+        import database
+
+        db_path = tmp_path / "test.db"
+        with patch("database.DB_PATH", db_path):
+            await database.init_db()
+            assert await database.get_user_sent_links(111) == set()
+
+            await database.mark_user_sent(111, "https://a.test")
+            await database.mark_user_sent(111, "https://b.test")
+            assert await database.get_user_sent_links(111) == {
+                "https://a.test", "https://b.test",
+            }
+            # A different (e.g. newly registered) user has their own,
+            # independent, initially-empty record — they are not
+            # affected by what's already been sent to someone else.
+            assert await database.get_user_sent_links(222) == set()
+
+    @pytest.mark.asyncio
+    async def test_prune_old_user_sent_news(self, tmp_path):
+        import aiosqlite
+        import database
+
+        db_path = tmp_path / "test.db"
+        with patch("database.DB_PATH", db_path):
+            await database.init_db()
+            await database.mark_user_sent(111, "https://old.test")
+            async with aiosqlite.connect(db_path) as db:
+                await db.execute("UPDATE user_sent_news SET sent = datetime('now', '-10 days')")
+                await db.commit()
+
+            await database.prune_old_user_sent_news(days=3)
+            assert await database.get_user_sent_links(111) == set()
+
+    @pytest.mark.asyncio
+    async def test_failed_send_not_marked_delivered(self):
+        """If sending an item to a user fails, it must not be recorded as
+        delivered — otherwise that user loses the item permanently instead
+        of getting it retried at the next scheduled digest."""
+        from bot import _send_personalized_digest
+
+        items = [{
+            "title": "News 1", "link": "https://test1.com", "summary": "s",
+            "source": "test", "image_url": None, "categories": {"general"},
+        }]
+
+        with patch("database.get_disabled_topics", return_value=set()):
+            with patch("database.get_user_sent_links", return_value=set()):
+                with patch("database.mark_user_sent", new_callable=AsyncMock) as mock_mark:
+                    call_count = 0
+
+                    async def header_ok_item_fails(**kwargs):
+                        nonlocal call_count
+                        call_count += 1
+                        if call_count > 1:
+                            raise Exception("send failed")
+
+                    with patch("bot.bot.send_message", side_effect=header_ok_item_fails):
+                        await _send_personalized_digest(111, 111, items, record_sent=True)
+                        mock_mark.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_successful_send_marked_delivered(self):
+        from bot import _send_personalized_digest
+
+        items = [{
+            "title": "News 1", "link": "https://test1.com", "summary": "s",
+            "source": "test", "image_url": None, "categories": {"general"},
+        }]
+
+        with patch("database.get_disabled_topics", return_value=set()):
+            with patch("database.get_user_sent_links", return_value=set()):
+                with patch("bot.bot.send_message", new_callable=AsyncMock):
+                    with patch("database.mark_user_sent", new_callable=AsyncMock) as mock_mark:
+                        await _send_personalized_digest(111, 111, items, record_sent=True)
+                        mock_mark.assert_awaited_once_with(111, "https://test1.com")
+
+    @pytest.mark.asyncio
+    async def test_already_delivered_item_not_resent(self):
+        """A user who already has an item in user_sent_news shouldn't get
+        it broadcast to them again at the next scheduled digest."""
+        from bot import _send_personalized_digest
+
+        items = [{
+            "title": "News 1", "link": "https://test1.com", "summary": "s",
+            "source": "test", "image_url": None, "categories": {"general"},
+        }]
+
+        with patch("database.get_disabled_topics", return_value=set()):
+            with patch("database.get_user_sent_links", return_value={"https://test1.com"}):
+                with patch("bot.bot.send_message", new_callable=AsyncMock) as mock_send:
+                    result = await _send_personalized_digest(111, 111, items, record_sent=True)
+                    assert result is False
+                    mock_send.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_on_demand_digest_ignores_delivery_history(self):
+        """/digest (record_sent=False) is a live snapshot, not a delivery
+        channel: it must not consult or write user_sent_news, so it never
+        hides an item the scheduled broadcast hasn't sent yet, and never
+        suppresses the scheduled broadcast from reaching a subscriber."""
+        from bot import _send_personalized_digest
+
+        items = [{
+            "title": "News 1", "link": "https://test1.com", "summary": "s",
+            "source": "test", "image_url": None, "categories": {"general"},
+        }]
+
+        with patch("database.get_disabled_topics", return_value=set()):
+            with patch("database.get_user_sent_links", new_callable=AsyncMock) as mock_get:
+                with patch("bot.bot.send_message", new_callable=AsyncMock):
+                    with patch("database.mark_user_sent", new_callable=AsyncMock) as mock_mark:
+                        result = await _send_personalized_digest(111, 111, items, record_sent=False)
+                        assert result is True
+                        mock_get.assert_not_called()
+                        mock_mark.assert_not_called()
+
+
+# --- Test 9: HTML escaping in Telegram messages ---
+
+class TestHTMLEscaping:
+    """Telegram's HTML parse mode breaks (or can be abused) on unescaped
+    '<', '>', '&' from external input — RSS titles, scraped listing
+    fields, LLM output, third-party URLs."""
+
+    def test_telegram_text_escapes_special_chars(self):
+        from telegram_format import telegram_text
+
+        assert telegram_text("<b>hi</b> & co") == "&lt;b&gt;hi&lt;/b&gt; &amp; co"
+
+    def test_telegram_url_accepts_http_https(self):
+        from telegram_format import telegram_url
+
+        assert telegram_url("https://example.com/a?b=1") == "https://example.com/a?b=1"
+
+    def test_telegram_url_rejects_non_http_scheme(self):
+        from telegram_format import telegram_url
+
+        with pytest.raises(ValueError):
+            telegram_url("javascript:alert(1)")
+        with pytest.raises(ValueError):
+            telegram_url("not a url at all")
+
+    def test_telegram_link_falls_back_to_text_on_bad_url(self):
+        from telegram_format import telegram_link
+
+        assert telegram_link("javascript:alert(1)", "click me") == "click me"
+
+    def test_digest_caption_escapes_html_in_external_fields(self):
+        from bot import _digest_item_caption
+
+        item = {
+            "title": "Цены <script>alert(1)</script> выросли",
+            "source": "test & co",
+            "link": "https://example.com/a",
+            "summary": "текст с <тегами> и & амперсандом",
+        }
+        caption = _digest_item_caption(1, item)
+        assert "<script>" not in caption
+        assert "&lt;script&gt;" in caption
+        assert "test &amp; co" in caption
+
+
+# --- Test 10: Telegram message length limits ---
+
+class TestTelegramLimits:
+    def test_digest_caption_within_photo_caption_limit(self):
+        """Telegram's photo caption limit is 1024 chars — a long RSS
+        summary must be trimmed to fit, not sent as-is and rejected."""
+        from bot import _digest_item_caption
+
+        item = {
+            "title": "A" * 100,
+            "source": "test",
+            "link": "https://example.com/" + "a" * 200,
+            "summary": "B" * 5000,
+        }
+        caption = _digest_item_caption(1, item)
+        assert len(caption) <= 1024
+
+
+# --- Test 11: RSS whitelist / date parsing hardening ---
+
+class TestParserHardening:
+    def test_whitelist_rejects_lookalike_domain(self):
+        """"eviln1info.rs" ends with the same characters as "n1info.rs"
+        but is a completely different, unrelated domain — plain
+        str.endswith() would wrongly accept it."""
+        from parser import _domain_in_whitelist
+
+        assert _domain_in_whitelist("https://eviln1info.rs/fake") is False
+        assert _domain_in_whitelist("https://n1info.rs/real") is True
+
+    def test_whitelist_accepts_real_subdomain(self):
+        from parser import _domain_in_whitelist
+
+        assert _domain_in_whitelist("https://www.blic.rs/article") is True
+
+    def test_entry_link_returns_none_for_unwhitelisted_link(self):
+        """No fallback to an unwhitelisted link — if nothing in the entry
+        matches, the entry is dropped, not forwarded anyway."""
+        from parser import _entry_link
+
+        entry = {"links": [{"href": "https://eviln1info.rs/fake"}]}
+        assert _entry_link(entry) is None
+
+    def test_pub_date_without_timezone_is_utc_aware(self):
+        """A naive datetime here would raise TypeError when compared
+        against the timezone-aware cutoff in collect_news()."""
+        from parser import _parse_pub_date
+
+        entry = {"published": "Wed, 12 Aug 2026 10:00:00"}  # no TZ offset
+        result = _parse_pub_date(entry)
+        assert result is not None
+        assert result.tzinfo is not None
+
+
+# --- Test 12: SQLite schema migrations ---
+
+class TestDatabaseMigrations:
+    @pytest.mark.asyncio
+    async def test_init_db_idempotent_and_complete(self, tmp_path):
+        """init_db() runs on every startup against a possibly-existing
+        production DB — it must be safe to call repeatedly, and every
+        table/column added by later migrations must actually exist."""
+        import aiosqlite
+        import database
+
+        db_path = tmp_path / "test.db"
+        with patch("database.DB_PATH", db_path):
+            await database.init_db()
+            await database.init_db()  # must not raise
+
+            async with aiosqlite.connect(db_path) as db:
+                cursor = await db.execute("PRAGMA table_info(real_estate_listings)")
+                cols = {row[1] for row in await cursor.fetchall()}
+                assert {"city", "deal_type", "price_value"}.issubset(cols)
+
+                cursor = await db.execute("SELECT name FROM sqlite_master WHERE type='table'")
+                tables = {row[0] for row in await cursor.fetchall()}
+                assert {"user_sent_news", "user_disabled_topics", "real_estate_listings"}.issubset(tables)
 
 
 if __name__ == "__main__":

@@ -80,6 +80,7 @@ nano .env
 BOT_TOKEN=токен_от_BotFather
 CHAT_ID=твой_личный_telegram_chat_id
 GIGACHAT_CREDENTIALS=credentials_от_GigaChat
+GIGACHAT_CA_BUNDLE=/root/msp-news-bot/certs/russian_trusted_root_ca.pem
 ```
 
 Пояснение по `CHAT_ID`: сейчас эта переменная не используется для рассылки
@@ -87,6 +88,22 @@ GIGACHAT_CREDENTIALS=credentials_от_GigaChat
 из таблицы `users` в `sent_news.db`). Переменная оставлена как задел на
 будущее (например, для модерации/уведомлений), но обязательна для запуска
 (`config.py` падает при старте, если её нет в окружении).
+
+Пояснение по `GIGACHAT_CA_BUNDLE` — необязательная, но настоятельно
+рекомендуемая переменная. GigaChat API отдаёт сертификат, подписанный
+корневым УЦ Минцифры, которого нет в стандартных системных доверенных
+корнях — без этой переменной `gigachat_client.py` откатывается на
+`verify_ssl_certs=False` (TLS-проверка полностью отключена для всего
+трафика к GigaChat: credentials, вопросы пользователей, ответы ИИ — MITM
+никак не будет обнаружен). Правильный путь:
+```bash
+mkdir -p /root/msp-news-bot/certs
+curl -o /root/msp-news-bot/certs/russian_trusted_root_ca.pem \
+  https://gu-st.ru/content/Other/doc/russian_trusted_root_ca_pem.crt
+```
+и прописать путь к нему в `GIGACHAT_CA_BUNDLE`. При старте бота в логах
+будет WARNING, если переменная не настроена — это ожидаемо на сервере, где
+она ещё не заведена, но должно быть исправлено до продакшена.
 
 Ограничить права на файл:
 ```bash
@@ -160,7 +177,7 @@ systemctl status msp-news-bot
 | Сервис не стартует (`systemctl status` — failed) | `journalctl -u msp-news-bot -n 50` — обычно не хватает переменной в `.env` или зависимости |
 | Бот не отвечает в Telegram | `BOT_TOKEN` верный? Сервис вообще запущен (`systemctl status`)? |
 | Голосовые сообщения не распознаются | `ffmpeg -version` — установлен ли ffmpeg |
-| Ошибки от GigaChat | `GIGACHAT_CREDENTIALS` актуальны (не истекли)? В `gigachat_client.py` намеренно отключена проверка TLS-сертификата (`verify_ssl_certs=False`) — это осознанное решение из-за корневого сертификата Минцифры, трогать не нужно |
+| Ошибки от GigaChat | `GIGACHAT_CREDENTIALS` актуальны (не истекли)? Если в логах WARNING про `GIGACHAT_CA_BUNDLE not set` — см. раздел про `.env` выше, TLS-проверка сейчас отключена |
 | RSS-новости не приходят | Часть источников может быть недоступна из региона сервера (проверялось: `tass.ru`, `n1info.rs`, `blic.rs` иногда отдают HTTP 403) — это не баг деплоя, а доступность конкретных сайтов |
 
 ## 9. (Опционально) Тесты перед деплоем на прод

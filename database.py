@@ -69,6 +69,23 @@ async def init_db() -> None:
             )
             """
         )
+        # Per-user delivery record for the scheduled digest broadcast.
+        # `sent_news` (above) is a global "have we ever seen this link"
+        # log used only for /news and /status — it must NOT gate what a
+        # given user gets sent, or a user whose send failed (or who
+        # subscribed after the item was already broadcast to others) would
+        # never see it. Delivery success/failure is tracked per user here,
+        # and only written after an actual successful send.
+        await db.execute(
+            """
+            CREATE TABLE IF NOT EXISTS user_sent_news (
+                user_id INTEGER NOT NULL,
+                link    TEXT    NOT NULL,
+                sent    TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY (user_id, link)
+            )
+            """
+        )
         # Migration: city / deal_type / price_value were added later, for
         # the real-estate menu's filter+sort feature. ALTER TABLE ADD
         # COLUMN is not naturally idempotent in SQLite, so on a database
@@ -390,6 +407,57 @@ async def get_disabled_topics(user_id: int) -> set[str]:
     except Exception as exc:
         logger.error("DB get_disabled_topics error: %s", exc)
         return set()
+
+
+async def mark_user_sent(user_id: int, link: str) -> None:
+    """Record that this specific user was successfully sent this item.
+
+    Only call this after the send actually succeeded — this table is the
+    source of truth for "did this user get this news item", used to avoid
+    re-sending the same item to them at the next scheduled digest.
+    """
+    try:
+        async with aiosqlite.connect(DB_PATH) as db:
+            await db.execute(
+                "INSERT OR IGNORE INTO user_sent_news (user_id, link) VALUES (?, ?)",
+                (user_id, link),
+            )
+            await db.commit()
+    except Exception as exc:
+        logger.error("DB mark_user_sent error: %s", exc)
+
+
+async def get_user_sent_links(user_id: int) -> set[str]:
+    """Return the set of links already delivered to this user."""
+    try:
+        async with aiosqlite.connect(DB_PATH) as db:
+            cursor = await db.execute(
+                "SELECT link FROM user_sent_news WHERE user_id = ?",
+                (user_id,),
+            )
+            rows = await cursor.fetchall()
+            return {row[0] for row in rows}
+    except Exception as exc:
+        logger.error("DB get_user_sent_links error: %s", exc)
+        return set()
+
+
+async def prune_old_user_sent_news(days: int = 3) -> None:
+    """Delete per-user delivery records older than `days`.
+
+    collect_news() only ever returns items from the last 24h, so nothing
+    older than that can be re-offered anyway — this just keeps the table
+    from growing forever across every user × every item ever broadcast.
+    """
+    try:
+        async with aiosqlite.connect(DB_PATH) as db:
+            await db.execute(
+                "DELETE FROM user_sent_news WHERE sent < datetime('now', ?)",
+                (f"-{days} days",),
+            )
+            await db.commit()
+    except Exception as exc:
+        logger.error("DB prune_old_user_sent_news error: %s", exc)
 
 
 async def toggle_topic(user_id: int, topic: str) -> bool:

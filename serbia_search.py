@@ -2,9 +2,7 @@
 
 from __future__ import annotations
 
-import asyncio
 import logging
-import re
 import socket
 from dataclasses import dataclass
 from urllib.parse import quote_plus
@@ -13,6 +11,7 @@ import aiohttp
 from bs4 import BeautifulSoup
 
 from gigachat_client import get_gigachat_client
+from telegram_format import telegram_link, telegram_text
 
 logger = logging.getLogger(__name__)
 
@@ -94,18 +93,23 @@ async def search_serbia_info(query: str) -> tuple[str, list[SearchResult]]:
 
 
 def format_answer_with_sources(answer: str, sources: list[SearchResult]) -> str:
-    """Format the answer with source links."""
+    """Format the answer with source links.
+
+    Both the model's answer text and every source title/URL are
+    external/untrusted input (search results, LLM output) — escaped here
+    since this string is sent with parse_mode="HTML".
+    """
     if not sources:
-        return answer
+        return telegram_text(answer)
 
     # Add sources section
     sources_text = "\n\n📚 <b>Источники:</b>\n"
     for i, source in enumerate(sources, 1):
         # Truncate title if too long
         title = source.title[:80] + "..." if len(source.title) > 80 else source.title
-        sources_text += f"{i}. <a href=\"{source.url}\">{title}</a>\n"
+        sources_text += f"{i}. {telegram_link(source.url, title)}\n"
 
-    return answer + sources_text
+    return telegram_text(answer) + sources_text
 
 
 # System prompt for GigaChat with context

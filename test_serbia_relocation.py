@@ -1,6 +1,5 @@
 """Tests for Serbia Relocation Bot."""
 
-import asyncio
 import pytest
 import sqlite3
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -168,7 +167,6 @@ class TestBotResponses:
     async def test_help_command(self):
         """Help command should mention Serbia relocation."""
         from bot import cmd_help
-        from aiogram.types import Message
 
         message = AsyncMock()
         message.answer = AsyncMock()

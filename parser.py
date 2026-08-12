@@ -23,16 +23,32 @@ MOSCOW_TZ = timezone(timedelta(hours=3))
 
 
 def _domain_in_whitelist(url: str) -> bool:
-    """Check whether the URL's domain is in the whitelist."""
+    """Check whether the URL's domain is in (or a subdomain of) the whitelist.
+
+    Exact match or a proper subdomain only — plain `.endswith(d)` would
+    also match a domain that merely ends with the same characters, e.g.
+    "eviln1info.rs".endswith("n1info.rs") is True even though it's an
+    unrelated (attacker-controlled) domain.
+    """
     try:
-        host = urlparse(url).hostname or ""
-        return any(host.endswith(d) for d in WHITELIST_DOMAINS)
+        host = (urlparse(url).hostname or "").lower().rstrip(".")
+        if not host:
+            return False
+        return any(
+            host == domain or host.endswith(f".{domain}")
+            for domain in WHITELIST_DOMAINS
+        )
     except Exception:
         return False
 
 
 def _entry_link(entry: dict) -> str | None:
-    """Extract the first link whose domain is whitelisted."""
+    """Extract the first link whose domain is whitelisted, or None.
+
+    No longer falls back to an unwhitelisted link — a feed entry can point
+    anywhere in its <link>/<links>, and the whole point of WHITELIST_DOMAINS
+    is to bound what URLs this bot will ever forward to users.
+    """
     links = entry.get("links", [])
     if not links and entry.get("link"):
         links = [{"href": entry["link"]}]
@@ -40,21 +56,27 @@ def _entry_link(entry: dict) -> str | None:
         href = link.get("href", "")
         if _domain_in_whitelist(href):
             return href
-    # Fallback: accept any link from a whitelisted feed (the feed itself
-    # is whitelisted, so individual links may point to non-whitelisted
-    # subdomains — we still accept them).
-    if links:
-        return links[0].get("href")
     return None
 
 
 def _parse_pub_date(entry: dict) -> datetime | None:
-    """Best-effort extraction of a timezone-aware pub date."""
+    """Best-effort extraction of a timezone-aware (UTC) pub date.
+
+    Some feeds omit the timezone offset in their RFC822 date, which makes
+    parsedate_to_datetime() return a naive datetime — comparing that
+    against the timezone-aware `cutoff` in collect_news() raises
+    TypeError, which would otherwise take the whole feed down (caught by
+    the outer per-entry try/except, but still loses every entry from that
+    feed for no good reason). Treat a missing offset as UTC.
+    """
     raw = entry.get("published") or entry.get("updated")
     if not raw:
         return None
     try:
-        return parsedate_to_datetime(raw)
+        parsed = parsedate_to_datetime(raw)
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return parsed.astimezone(timezone.utc)
     except Exception:
         pass
     # feedparser sometimes gives a struct_time
@@ -79,6 +101,21 @@ def _score(entry: dict) -> int:
     return sum(1 for kw in MSP_KEYWORDS if kw.lower() in text)
 
 
+def _is_safe_media_url(url: str) -> bool:
+    """Only allow plain http(s) URLs through.
+
+    image_url ends up handed to Telegram (URLInputFile — Telegram's own
+    servers fetch it, not ours), but a feed entry is external input and
+    shouldn't be able to hand the bot something like a file:/data: URL or
+    an empty/garbage value that gets passed along unexamined.
+    """
+    try:
+        parsed = urlparse(url)
+    except ValueError:
+        return False
+    return parsed.scheme in {"http", "https"} and bool(parsed.netloc)
+
+
 def _entry_image(entry: dict) -> str | None:
     """Best-effort image URL for a feed entry, for the picture-digest feature.
 
@@ -88,7 +125,7 @@ def _entry_image(entry: dict) -> str | None:
     the caller falls back to a text-only message.
     """
     thumbs = entry.get("media_thumbnail") or []
-    if thumbs and thumbs[0].get("url"):
+    if thumbs and thumbs[0].get("url") and _is_safe_media_url(thumbs[0]["url"]):
         return thumbs[0]["url"]
 
     media = entry.get("media_content") or []
@@ -96,18 +133,19 @@ def _entry_image(entry: dict) -> str | None:
         url = m.get("url")
         medium = (m.get("medium") or "").lower()
         mtype = (m.get("type") or "").lower()
-        if url and (medium == "image" or mtype.startswith("image/") or not mtype):
+        if url and _is_safe_media_url(url) and (medium == "image" or mtype.startswith("image/") or not mtype):
             return url
 
     for enc in entry.get("enclosures", []) or entry.get("links", []):
         etype = (enc.get("type") or "").lower()
-        if etype.startswith("image/") and enc.get("href"):
-            return enc["href"]
+        href = enc.get("href")
+        if etype.startswith("image/") and href and _is_safe_media_url(href):
+            return href
 
     raw_html = entry.get("summary") or entry.get("description") or ""
     import re
     match = re.search(r'<img[^>]+src=["\']([^"\']+)["\']', raw_html)
-    if match:
+    if match and _is_safe_media_url(match.group(1)):
         return match.group(1)
 
     return None
@@ -162,25 +200,31 @@ async def _fetch_feed(
     cutoff = datetime.now(timezone.utc) - timedelta(hours=24)
 
     for entry in d.entries:
-        link = _entry_link(entry)
-        if not link:
-            continue
+        # One malformed entry (weird date format, missing fields, whatever)
+        # must not take out the rest of an otherwise-good feed.
+        try:
+            link = _entry_link(entry)
+            if not link:
+                continue
 
-        pub_date = _parse_pub_date(entry)
-        # If we can't parse the date, keep the entry (some feeds omit it)
-        if pub_date and pub_date < cutoff:
-            continue
+            pub_date = _parse_pub_date(entry)
+            # If we can't parse the date, keep the entry (some feeds omit it)
+            if pub_date and pub_date < cutoff:
+                continue
 
-        results.append(
-            {
-                "title": (entry.get("title") or "Без заголовка").strip(),
-                "link": link,
-                "summary": _entry_summary(entry),
-                "score": _score(entry),
-                "source": name,
-                "image_url": _entry_image(entry),
-            }
-        )
+            results.append(
+                {
+                    "title": (entry.get("title") or "Без заголовка").strip(),
+                    "link": link,
+                    "summary": _entry_summary(entry),
+                    "score": _score(entry),
+                    "source": name,
+                    "image_url": _entry_image(entry),
+                }
+            )
+        except Exception as exc:
+            logger.warning("Feed %s: skipping malformed entry: %s", name, exc)
+            continue
     return results
 
 
