@@ -51,7 +51,18 @@ MOSCOW_TZ = timezone(timedelta(hours=3))
 # falling back. Same fix already applied to aiohttp usage in parser.py,
 # real_estate.py and serbia_search.py — this covers the Bot API session
 # itself (getUpdates/sendMessage/etc.), which was the one gap left.
-_bot_session = AiohttpSession()
+#
+# If TELEGRAM_PROXY_URL is set, all Bot API traffic is additionally routed
+# through it — used to work around DPI-level interference on HTTPS to
+# api.telegram.org from the RU-hosted VDS (measured: ~2.5% request failure
+# rate, ~195 errors/day, despite a clean ICMP path). Only Telegram traffic
+# goes through the proxy; GigaChat and RSS/real-estate scraping stay direct,
+# since GigaChat access depends on the server being in Russia.
+if config.TELEGRAM_PROXY_URL:
+    _bot_session = AiohttpSession(proxy=config.TELEGRAM_PROXY_URL)
+    logger.info("Telegram Bot API traffic routed via proxy")
+else:
+    _bot_session = AiohttpSession()
 _bot_session._connector_init["family"] = socket.AF_INET
 
 bot = Bot(token=config.BOT_TOKEN, session=_bot_session)

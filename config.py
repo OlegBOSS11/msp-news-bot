@@ -7,6 +7,13 @@ BOT_TOKEN: str = os.environ["BOT_TOKEN"]
 CHAT_ID: int = int(os.environ["CHAT_ID"])
 GIGACHAT_CREDENTIALS: str = os.environ["GIGACHAT_CREDENTIALS"]
 
+# Optional: route only Telegram Bot API traffic (getUpdates/sendMessage/etc.)
+# through a SOCKS5 proxy — e.g. a small VPS in the EU, to work around
+# intermittent DPI-level interference on HTTPS to api.telegram.org from the
+# RU-hosted VDS. Leave unset to talk to Telegram directly (default).
+# Format: socks5://user:password@host:port
+TELEGRAM_PROXY_URL: str | None = os.environ.get("TELEGRAM_PROXY_URL") or None
+
 # --- Serbian news sources (for translation) ---
 SERBIAN_NEWS_SOURCES: list[str] = ["n1info.rs", "blic.rs", "telegraf.rs", "b92.net", "kurir.rs"]
 

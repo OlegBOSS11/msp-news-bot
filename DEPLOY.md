@@ -173,3 +173,99 @@ BOT_TOKEN=123456:test-token CHAT_ID=123456 GIGACHAT_CREDENTIALS=test:cred \
 ```
 Все тесты должны быть зелёными (37 тестов на момент последнего обновления
 этого файла).
+
+## 10. (Опционально) Прокси для Telegram-трафика через EU VPS
+
+Зачем: если сервер бота стоит в России, `api.telegram.org` бывает
+нестабилен именно на HTTPS-уровне (не путать с обрывом сети целиком —
+`ping`/`mtr` могут быть идеально чистыми). Симптомы: кнопки меню временно
+"замирают" и сами отвисают через 10-20 сек, дайджест зависает на сборе и
+дособирается сам, в `journalctl` — `aiogram.exceptions.TelegramNetworkError:
+Request timeout error` с последующим авто-retry. Похоже на DPI-уровневое
+вмешательство именно в трафик к Telegram, а не на общую проблему сети или
+код бота.
+
+Решение — направить **только** Bot API трафик (`getUpdates`, `sendMessage`
+и т.д.) через SOCKS5-прокси на отдельном маленьком VPS в ЕС (например,
+Hetzner ~€3.79/мес, Amsterdam/Falkenstein). GigaChat и парсинг RSS/недвижимости
+остаются идти напрямую с российского сервера — это осознанно, доступ к
+GigaChat зависит от того, что сервер физически в России.
+
+### 10.1. На EU VPS: поднять SOCKS5-прокси (microsocks)
+
+```bash
+apt update && apt install -y git build-essential
+git clone https://github.com/rofl0r/microsocks.git
+cd microsocks
+make
+cp microsocks /usr/local/bin/
+```
+
+Systemd-юнит:
+```bash
+nano /etc/systemd/system/microsocks.service
+```
+```ini
+[Unit]
+Description=microsocks SOCKS5 proxy for Telegram traffic
+After=network.target
+
+[Service]
+ExecStart=/usr/local/bin/microsocks -1 -i 0.0.0.0 -p 1080 -u ПРОКСИ_ЛОГИН -P ПРОКСИ_ПАРОЛЬ
+Restart=always
+User=nobody
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target
+```
+`-1` — требовать авторизацию даже без неё бы разрешил анонимный доступ.
+Логин/пароль — свои, посложнее.
+
+```bash
+systemctl daemon-reload
+systemctl enable --now microsocks
+systemctl status microsocks
+```
+
+**Файрвол — обязательно**, иначе прокси открыт всему интернету:
+```bash
+ufw allow from 138.16.170.104 to any port 1080 proto tcp
+ufw status
+```
+(Подставить актуальный IP российского VDS, если он другой.)
+
+### 10.2. На российском VDS (сервер бота): подключить прокси
+
+`aiohttp-socks` уже в `requirements.txt` — если ставили зависимости раньше
+и `pip install` не переделывали, доустановить:
+```bash
+source venv/bin/activate
+pip install aiohttp-socks==0.12.0
+```
+
+Добавить в `.env`:
+```
+TELEGRAM_PROXY_URL=socks5://ПРОКСИ_ЛОГИН:ПРОКСИ_ПАРОЛЬ@IP_EU_VPS:1080
+```
+
+Больше ничего менять не нужно — `bot.py` сам подхватывает переменную:
+если она задана, весь трафик к Telegram Bot API идёт через прокси; если
+не задана (переменной нет в `.env`) — бот работает как раньше, напрямую.
+
+```bash
+systemctl restart msp-news-bot
+journalctl -u msp-news-bot -n 20 --no-pager
+```
+Должна появиться строка `Telegram Bot API traffic routed via proxy` сразу
+после старта — значит прокси подхватился.
+
+### 10.3. Проверка и откат
+
+Дальше — то же самое сравнение по логам, что и для IPv4-фикса:
+```bash
+journalctl -u msp-news-bot --since "24 hours ago" | grep -ic error
+```
+Если хотите быстро откатиться на прямое подключение — удалить/закомментировать
+`TELEGRAM_PROXY_URL` в `.env` и `systemctl restart msp-news-bot`, без
+доп. изменений в коде.

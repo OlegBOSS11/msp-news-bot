@@ -11,3 +11,4 @@ SpeechRecognition==3.17.0
 pydub==0.25.1
 deep-translator==1.11.4
 requests==2.33.1
+aiohttp-socks==0.12.0
