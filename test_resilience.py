@@ -559,6 +559,37 @@ class TestTelegramLimits:
         caption = _digest_item_caption(1, item)
         assert len(caption) <= 1024
 
+    def test_caption_truncation_never_splits_an_html_entity(self):
+        """Truncating escaped text can cut inside "&amp;" and leave "&am",
+        which Telegram rejects with a 400 — losing the item for that user
+        on both the photo and the text fallback."""
+        import re
+        from bot import _digest_item_caption
+
+        broken_entity = re.compile(r"&(?!amp;|lt;|gt;)[a-zA-Z]{0,6}(?:…|$)")
+        for offset in range(12):
+            item = {
+                "title": "T",
+                "source": "s",
+                "link": "https://example.com/a",
+                # Sweep the '&' across the truncation boundary.
+                "summary": "x" * (900 - offset) + " A & B " + "y" * 300,
+            }
+            caption = _digest_item_caption(1, item)
+            assert len(caption) <= 1024, f"offset={offset}"
+            assert not broken_entity.search(caption), f"offset={offset}: {caption[-30:]!r}"
+
+    def test_caption_of_all_ampersand_summary_still_fits(self):
+        """Pathological case: every char escapes to 5 chars."""
+        from bot import _digest_item_caption
+
+        caption = _digest_item_caption(1, {
+            "title": "T", "source": "s",
+            "link": "https://example.com/a", "summary": "&" * 500,
+        })
+        assert len(caption) <= 1024
+        assert caption.count("&") == caption.count("&amp;")
+
 
 # --- Test 11: RSS whitelist / date parsing hardening ---
 
@@ -730,6 +761,102 @@ class TestRealEstateFilterKeyboard:
         assert oldest_button.text.startswith("⬜")
         # Switching date doesn't touch the active price filter.
         assert oldest_button.callback_data == "re_sort:beograd:rent:a:o"
+
+
+class TestRealEstateLegacyCallbacks:
+    """Buttons from before the checkbox rework stay in users' chat history
+    forever after a deploy, so their callback_data must keep working."""
+
+    @pytest.mark.parametrize("legacy,expected", [
+        ("newest", ("-", "n")),
+        ("oldest", ("-", "o")),
+        ("price_asc", ("a", "n")),
+        ("price_desc", ("d", "n")),
+        ("something_unknown", ("-", "n")),
+    ])
+    @pytest.mark.asyncio
+    async def test_legacy_sort_callback_data_still_works(self, legacy, expected):
+        import bot
+
+        callback = AsyncMock()
+        callback.data = f"re_sort:beograd:rent:{legacy}"
+        with patch("bot._show_real_estate_results", new_callable=AsyncMock) as mock_show:
+            await bot.cb_real_estate_sort(callback)
+            mock_show.assert_awaited_once()
+            _, city, deal, price_dir, date_dir = mock_show.await_args[0]
+            assert (city, deal) == ("beograd", "rent")
+            assert (price_dir, date_dir) == expected
+
+    @pytest.mark.asyncio
+    async def test_current_format_still_works(self):
+        import bot
+
+        callback = AsyncMock()
+        callback.data = "re_sort:novi-sad:sale:d:o"
+        with patch("bot._show_real_estate_results", new_callable=AsyncMock) as mock_show:
+            await bot.cb_real_estate_sort(callback)
+            _, city, deal, price_dir, date_dir = mock_show.await_args[0]
+            assert (city, deal, price_dir, date_dir) == ("novi-sad", "sale", "d", "o")
+
+    @pytest.mark.asyncio
+    async def test_malformed_callback_data_does_not_raise(self):
+        import bot
+
+        callback = AsyncMock()
+        callback.data = "re_sort:beograd"  # truncated / corrupt
+        with patch("bot._show_real_estate_results", new_callable=AsyncMock) as mock_show:
+            await bot.cb_real_estate_sort(callback)  # must not raise
+            mock_show.assert_not_called()
+
+
+class TestSearchResultUrls:
+    """DuckDuckGo renders .result__url as a *display* URL with no scheme,
+    which telegram_url() rightly rejects — leaving every source link
+    rendered as plain text unless the scheme is restored."""
+
+    @pytest.mark.asyncio
+    async def test_schemeless_ddg_url_becomes_a_real_link(self):
+        from telegram_format import telegram_link
+        import serbia_search
+
+        html = """
+        <div class="result">
+          <a class="result__title">Заголовок</a>
+          <span class="result__url">n1info.rs/vesti/nesto</span>
+          <span class="result__snippet">Текст</span>
+        </div>
+        """
+
+        class _Resp:
+            status = 200
+
+            async def text(self):
+                return html
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *a):
+                return False
+
+        class _Session:
+            def get(self, *a, **kw):
+                return _Resp()
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *a):
+                return False
+
+        with patch("aiohttp.ClientSession", return_value=_Session()):
+            with patch("aiohttp.TCPConnector"):
+                results = await serbia_search.search_web("test")
+
+        assert results, "expected the stub result to be parsed"
+        assert results[0].url == "https://n1info.rs/vesti/nesto"
+        # The whole point: it must survive as an <a href=...>, not plain text.
+        assert telegram_link(results[0].url, "Заголовок").startswith("<a href=")
 
 
 if __name__ == "__main__":

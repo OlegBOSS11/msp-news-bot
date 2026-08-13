@@ -54,9 +54,16 @@ async def search_web(query: str, num_results: int = 5) -> list[SearchResult]:
                             url = url_el.get_text(strip=True)
                             snippet = snippet_el.get_text(strip=True) if snippet_el else ""
 
-                            # Clean up URL (DuckDuckGo sometimes adds redirects)
+                            # .result__url's *text* is a display URL, which
+                            # DuckDuckGo renders without a scheme
+                            # ("n1info.rs/vesti/nesto"). telegram_url()
+                            # rightly rejects schemeless values, so without
+                            # this every source would be rendered as plain
+                            # text instead of a link.
                             if url.startswith("//"):
                                 url = "https:" + url
+                            elif not url.startswith(("http://", "https://")):
+                                url = "https://" + url
 
                             results.append(SearchResult(
                                 title=title,

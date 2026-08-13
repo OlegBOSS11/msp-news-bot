@@ -136,8 +136,8 @@ sort, limit)` — используется меню бота (`bot.py`, кноп
 4. Добавьте сбор в `refresh_real_estate_database()` и апсерты в БД.
 5. Заголовок/локация/цена объявления — данные со стороннего сайта, то есть
    внешний ввод. Если формируете текст сообщения с `parse_mode="HTML"`
-   (как `_send_real_estate_listing()` в `bot.py` или `format_listings()` в
-   `real_estate.py`), оборачивайте их в `telegram_text()` /
+   (как `_send_real_estate_listing()` в `bot.py`), оборачивайте их в
+   `telegram_text()` /
    `telegram_link()` из `telegram_format.py` — иначе `<`, `>`, `&` в
    заголовке объявления сломают сообщение или подменят ссылку. Смотрите,
    как это уже сделано в `_send_real_estate_listing()`.

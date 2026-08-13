@@ -454,12 +454,16 @@ async def get_user_sent_links(user_id: int) -> set[str]:
         return set()
 
 
-async def prune_old_user_sent_news(days: int = 3) -> None:
+async def prune_old_user_sent_news(days: int = 30) -> None:
     """Delete per-user delivery records older than `days`.
 
-    collect_news() only ever returns items from the last 24h, so nothing
-    older than that can be re-offered anyway — this just keeps the table
-    from growing forever across every user × every item ever broadcast.
+    The window has to outlive how long an item can keep reappearing in a
+    feed, not just collect_news()'s 24h cutoff: _fetch_feed() deliberately
+    keeps entries whose pub date can't be parsed, and such an entry stays
+    eligible for as long as the source lists it. Pruning too eagerly (the
+    original 3 days) meant a long-lived undated item lost its delivery
+    record and got re-broadcast to everyone. 30 days costs very little —
+    a handful of subscribers × ~15 items/day is a few thousand rows.
     """
     try:
         async with aiosqlite.connect(DB_PATH) as db:

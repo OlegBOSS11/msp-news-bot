@@ -9,6 +9,7 @@ from datetime import datetime, timedelta, timezone
 
 from aiogram import Bot, Dispatcher, F
 from aiogram.client.session.aiohttp import AiohttpSession
+from aiogram.exceptions import TelegramBadRequest
 from aiogram.filters import CommandStart, Command
 from aiogram.types import (
     Message,
@@ -317,11 +318,20 @@ def _digest_item_caption(idx: int, item: dict) -> str:
     header = f"<b>📌 {idx}. {title}</b>\n<i>Источник: {source}</i>\n"
     footer = f"\n🔗 {link}"
     budget = 1024 - len(header) - len(footer) - 1
-    summary = telegram_text(item["summary"])
+    raw_summary = item["summary"]
+    summary = telegram_text(raw_summary)
     if budget <= 0:
         summary = ""
     elif len(summary) > budget:
-        summary = summary[:budget - 1] + "…"
+        # Truncate the RAW text and escape afterwards, never the other way
+        # round: cutting escaped text can land inside an entity ("…&am")
+        # and Telegram rejects the whole message with a 400. Shrink until
+        # the escaped form fits — escaping only ever grows the string, so
+        # this terminates (summaries are ~300 chars, see _entry_summary).
+        cut = budget - 1
+        while cut > 0 and len(telegram_text(raw_summary[:cut])) > budget - 1:
+            cut -= 1
+        summary = telegram_text(raw_summary[:cut]) + "…"
     return header + summary + footer
 
 
@@ -417,7 +427,7 @@ async def send_daily_digest() -> None:
         except Exception as exc:
             logger.warning("DB mark_sent failed: %s", exc)
 
-    await database.prune_old_user_sent_news(days=3)
+    await database.prune_old_user_sent_news()
 
     user_ids = await database.get_all_user_ids()
     if not user_ids:
@@ -752,10 +762,30 @@ async def cb_real_estate_deal(callback: CallbackQuery) -> None:
     )
 
 
+# Old single-choice sort values → the equivalent (price_dir, date_dir)
+# pair. Buttons carrying the old callback_data stay live in users' chat
+# history forever after a deploy, so they must keep working.
+_LEGACY_SORT_MAP = {
+    "newest": ("-", "n"),
+    "oldest": ("-", "o"),
+    "price_asc": ("a", "n"),
+    "price_desc": ("d", "n"),
+}
+
+
 @dp.callback_query(F.data.startswith("re_sort:"))
 async def cb_real_estate_sort(callback: CallbackQuery) -> None:
-    _, city, deal, price_dir, date_dir = callback.data.split(":", 4)
+    parts = callback.data.split(":", 4)
     await callback.answer()
+    if len(parts) == 5:
+        _, city, deal, price_dir, date_dir = parts
+    elif len(parts) == 4:
+        # Legacy "re_sort:<city>:<deal>:<sort>" from a pre-checkbox message.
+        _, city, deal, legacy_sort = parts
+        price_dir, date_dir = _LEGACY_SORT_MAP.get(legacy_sort, ("-", "n"))
+    else:
+        logger.warning("Unrecognized re_sort callback_data: %r", callback.data)
+        return
     await _show_real_estate_results(callback, city, deal, price_dir, date_dir)
 
 
@@ -767,6 +797,22 @@ def _filters_summary_text(price_dir: str, date_dir: str) -> str:
         parts.append("дороже → дешевле")
     parts.append("сначала старые" if date_dir == "o" else "сначала новые")
     return ", ".join(parts)
+
+
+async def _safe_edit_text(message: Message, text: str, **kwargs) -> None:
+    """edit_text that tolerates "message is not modified".
+
+    Re-tapping an already-active filter (the date axis always has exactly
+    one value selected, so tapping it re-sends the same state) renders
+    identical text and markup, and Telegram answers that edit with a 400.
+    Nothing is wrong in that case — the screen is already what we want.
+    """
+    try:
+        await message.edit_text(text, **kwargs)
+    except TelegramBadRequest as exc:
+        if "message is not modified" not in str(exc):
+            raise
+        logger.debug("edit_text skipped — content unchanged")
 
 
 async def _show_real_estate_results(
@@ -785,7 +831,8 @@ async def _show_real_estate_results(
     )
 
     if not rows:
-        await callback.message.edit_text(
+        await _safe_edit_text(
+            callback.message,
             f"🏠 <b>{city_label} — {deal_label}</b>\n\n"
             "📭 Пока нет собранных объявлений под эти фильтры — сборщик "
             "обновляет базу каждые 6 часов. Попробуйте другой город, "
@@ -795,7 +842,8 @@ async def _show_real_estate_results(
         )
         return
 
-    await callback.message.edit_text(
+    await _safe_edit_text(
+        callback.message,
         f"🏠 <b>{city_label} — {deal_label}</b>\n{filters_label}\n\nНайдено: {len(rows)}",
         parse_mode="HTML",
     )
@@ -853,7 +901,13 @@ async def handle_question(message: Message) -> None:
     user_id = message.from_user.id
     await bot.send_chat_action(chat_id=message.chat.id, action="typing")
 
-    # Save user message to conversation history
+    # Read the prior turns BEFORE saving this one, and append the current
+    # question explicitly where the prompt is built. Reading it back out
+    # of the DB instead would make the prompt depend on save_message()
+    # succeeding — and that function swallows its errors (e.g. "database
+    # is locked" during a broadcast), which would silently hand the model
+    # a conversation without the question it is meant to answer.
+    history = await database.get_conversation_history(user_id, limit=10)
     await database.save_message(user_id, "user", user_text)
 
     # Check if the query is about real estate
@@ -950,17 +1004,14 @@ async def handle_question(message: Message) -> None:
                 logger.error("Serbia search error: %s", exc)
                 answer = "⚠️ Ошибка при поиске информации. Попробуйте позже."
         else:
-            # Use GigaChat for other questions (without web search)
-            # Get conversation history for context. save_message(user_id,
-            # "user", user_text) already ran above (top of this handler),
-            # so `history`'s last entry IS this question — do not append
-            # user_text again here, or the model sees it twice.
-            history = await database.get_conversation_history(user_id, limit=10)
-
-            # Build messages with history
+            # Use GigaChat for other questions (without web search).
+            # `history` was read at the top of this handler, before the
+            # current question was saved — so it holds only the prior
+            # turns and the question is appended once, explicitly.
             messages = [Messages(role="system", content=get_system_prompt())]
             for msg in history:
                 messages.append(Messages(role=msg["role"], content=msg["content"]))
+            messages.append(Messages(role="user", content=user_text))
 
             try:
                 giga = get_gigachat_client()
@@ -1052,16 +1103,17 @@ async def handle_voice(message: Message) -> None:
 
     user_id = message.from_user.id
 
-    # Save user message to conversation history
-    await database.save_message(user_id, "user", text)
-
-    # Get conversation history for context
+    # Prior turns first, then save, then append the transcript explicitly —
+    # see handle_question() for why the prompt must not depend on
+    # save_message() having succeeded.
     history = await database.get_conversation_history(user_id, limit=10)
+    await database.save_message(user_id, "user", text)
 
     # Build messages with history
     messages = [Messages(role="system", content=get_system_prompt())]
     for msg in history:
         messages.append(Messages(role=msg["role"], content=msg["content"]))
+    messages.append(Messages(role="user", content=text))
 
     try:
         giga = get_gigachat_client()

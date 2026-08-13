@@ -14,7 +14,6 @@ import requests
 from bs4 import BeautifulSoup
 
 import database
-from telegram_format import telegram_link, telegram_text
 
 logger = logging.getLogger(__name__)
 
@@ -477,39 +476,6 @@ async def search_real_estate(query: str = "") -> list[PropertyListing]:
         ]
 
     return all_listings[:15]  # Limit to 15 results
-
-
-def format_listings(listings: list[PropertyListing], is_predefined: bool = False) -> str:
-    """Format property listings for Telegram message.
-
-    Args:
-        is_predefined: True when `listings` came from the static
-            PREDEFINED_LISTINGS fallback rather than a live scrape — the
-            caller should set this so the message warns the user that the
-            prices/links may be outdated.
-    """
-    if not listings:
-        return "🏠 К сожалению, подходящих предложений не найдено. Попробуйте изменить запрос."
-
-    lines = ["🏠 <b>Актуальные предложения недвижимости в Сербии:</b>\n"]
-    if is_predefined:
-        lines.append(
-            "⚠️ <i>Не удалось получить свежие данные с сайтов. Это примерные "
-            "варианты — актуальность цен и наличие не гарантированы, "
-            "проверяйте по ссылке.</i>\n"
-        )
-
-    for i, listing in enumerate(listings, 1):
-        lines.append(f"<b>{i}. {telegram_text(listing.title)}</b>")
-        if listing.price:
-            lines.append(f"💰 Цена: {telegram_text(listing.price)}")
-        if listing.location:
-            lines.append(f"📍 Локация: {telegram_text(listing.location)}")
-        lines.append(f"🔗 {telegram_link(listing.url, 'Подробнее')}")
-        lines.append(f"🌐 Источник: {telegram_text(listing.source)}")
-        lines.append("")  # Empty line for spacing
-
-    return "\n".join(lines)
 
 
 # Keywords that indicate real estate query
