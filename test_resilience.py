@@ -622,5 +622,115 @@ class TestDatabaseMigrations:
                 assert {"user_sent_news", "user_disabled_topics", "real_estate_listings"}.issubset(tables)
 
 
+# --- Test 13: combinable real-estate filters (price + date, checkboxes) ---
+
+class TestRealEstateCombinedFilters:
+    """price_dir and date_dir are independent, combinable filters — not a
+    single mutually-exclusive sort choice."""
+
+    @pytest.mark.asyncio
+    async def test_price_primary_date_tiebreaker(self, tmp_path):
+        import database
+
+        db_path = tmp_path / "test.db"
+        with patch("database.DB_PATH", db_path):
+            await database.init_db()
+            # Two listings tied on price, one older, one newer.
+            await database.upsert_real_estate_listing(
+                "old-cheap", "Old cheap", "100 €", "Beograd", "https://x/1", None,
+                "HaloOglasi", city="beograd", deal_type="rent", price_value=100,
+            )
+            await database.upsert_real_estate_listing(
+                "new-cheap", "New cheap", "100 €", "Beograd", "https://x/2", None,
+                "HaloOglasi", city="beograd", deal_type="rent", price_value=100,
+            )
+            await database.upsert_real_estate_listing(
+                "pricey", "Pricey", "500 €", "Beograd", "https://x/3", None,
+                "HaloOglasi", city="beograd", deal_type="rent", price_value=500,
+            )
+            # Backdate "old-cheap" so date-as-tiebreaker is meaningful.
+            import aiosqlite
+            async with aiosqlite.connect(db_path) as db:
+                await db.execute(
+                    "UPDATE real_estate_listings SET first_seen = datetime('now', '-1 day') "
+                    "WHERE ad_id = 'old-cheap'"
+                )
+                await db.commit()
+
+            rows = await database.get_real_estate_listings_filtered(
+                city="beograd", deal_type="rent", price_dir="a", date_dir="n", limit=10,
+            )
+            # Cheapest first (price primary) — the two 100€ listings before
+            # the 500€ one — and within the tie, newest first (tiebreaker).
+            assert [r["ad_id"] for r in rows] == ["new-cheap", "old-cheap", "pricey"]
+
+    @pytest.mark.asyncio
+    async def test_no_price_filter_falls_back_to_date_only(self, tmp_path):
+        import database
+
+        db_path = tmp_path / "test.db"
+        with patch("database.DB_PATH", db_path):
+            await database.init_db()
+            await database.upsert_real_estate_listing(
+                "a", "A", "500 €", "Beograd", "https://x/a", None,
+                "HaloOglasi", city="beograd", deal_type="rent", price_value=500,
+            )
+            await database.upsert_real_estate_listing(
+                "b", "B", "100 €", "Beograd", "https://x/b", None,
+                "HaloOglasi", city="beograd", deal_type="rent", price_value=100,
+            )
+            # Backdate "a" so date order is unambiguous regardless of
+            # CURRENT_TIMESTAMP's second-level resolution.
+            import aiosqlite
+            async with aiosqlite.connect(db_path) as db:
+                await db.execute(
+                    "UPDATE real_estate_listings SET first_seen = datetime('now', '-1 day') "
+                    "WHERE ad_id = 'a'"
+                )
+                await db.commit()
+
+            # price_dir="-" (off): the pricier listing ("a", 500€) must NOT
+            # be pushed down by price — only date order applies, and "b"
+            # (inserted after backdating "a") sorts first as newest.
+            rows = await database.get_real_estate_listings_filtered(
+                city="beograd", deal_type="rent", price_dir="-", date_dir="n", limit=10,
+            )
+            assert [r["ad_id"] for r in rows] == ["b", "a"]
+
+
+class TestRealEstateFilterKeyboard:
+    """The filter panel toggles one dimension per tap while preserving the
+    other — this is what makes the two filters independently combinable."""
+
+    def test_tapping_active_price_button_turns_it_off(self):
+        from bot import real_estate_filters_kb
+
+        kb = real_estate_filters_kb("beograd", "rent", price_dir="a", date_dir="n")
+        price_asc_button = kb.inline_keyboard[0][0]
+        assert price_asc_button.text.startswith("✅")
+        assert price_asc_button.callback_data == "re_sort:beograd:rent:-:n"
+
+    def test_tapping_inactive_price_button_preserves_date(self):
+        from bot import real_estate_filters_kb
+
+        kb = real_estate_filters_kb("beograd", "rent", price_dir="-", date_dir="o")
+        price_desc_button = kb.inline_keyboard[1][0]
+        assert price_desc_button.text.startswith("⬜")
+        # Turns price on (desc) without disturbing the already-active
+        # "oldest first" date filter.
+        assert price_desc_button.callback_data == "re_sort:beograd:rent:d:o"
+
+    def test_date_buttons_are_mutually_exclusive_within_their_own_axis(self):
+        from bot import real_estate_filters_kb
+
+        kb = real_estate_filters_kb("beograd", "rent", price_dir="a", date_dir="n")
+        newest_button = kb.inline_keyboard[2][0]
+        oldest_button = kb.inline_keyboard[3][0]
+        assert newest_button.text.startswith("✅")
+        assert oldest_button.text.startswith("⬜")
+        # Switching date doesn't touch the active price filter.
+        assert oldest_button.callback_data == "re_sort:beograd:rent:a:o"
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

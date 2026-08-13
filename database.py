@@ -324,22 +324,34 @@ async def get_real_estate_listings(limit: int = 100) -> list[dict]:
 async def get_real_estate_listings_filtered(
     city: str | None = None,
     deal_type: str | None = None,
-    sort: str = "newest",
+    price_dir: str | None = None,
+    date_dir: str = "n",
     limit: int = 10,
 ) -> list[dict]:
     """Return listings for the real-estate menu, filtered and sorted.
 
+    Price and date are independent, combinable sort criteria (checkboxes
+    in the bot's UI) rather than a single mutually-exclusive choice — when
+    both are set, price is the primary key and date the tiebreaker.
+
     Args:
         city: HALOOGLASI_CITIES slug (e.g. "beograd"), or None for all cities.
         deal_type: "sale" or "rent", or None for both.
-        sort: "newest" | "oldest" | "price_asc" | "price_desc".
+        price_dir: "a" (cheapest first), "d" (priciest first), or None/"-"
+            to leave price out of the sort entirely.
+        date_dir: "o" (oldest first) or anything else (default) for newest
+            first. Always applied — either as the primary key, or as the
+            tiebreaker when price_dir is also set.
     """
-    order_by = {
-        "newest": "first_seen DESC",
-        "oldest": "first_seen ASC",
-        "price_asc": "price_value IS NULL, price_value ASC",
-        "price_desc": "price_value IS NULL, price_value DESC",
-    }.get(sort, "first_seen DESC")
+    order_parts = []
+    if price_dir in ("a", "d"):
+        # NULL price_value (couldn't be parsed from the listing) always
+        # sorts last regardless of direction, so a currently-priceless
+        # listing doesn't jump to the top of "cheapest first".
+        order_parts.append("price_value IS NULL")
+        order_parts.append(f"price_value {'ASC' if price_dir == 'a' else 'DESC'}")
+    order_parts.append(f"first_seen {'ASC' if date_dir == 'o' else 'DESC'}")
+    order_by = ", ".join(order_parts)
 
     conditions = []
     params: list = []

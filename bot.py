@@ -178,14 +178,6 @@ REAL_ESTATE_DEAL_LABELS = {
     "rent": "🏠 Снять",
 }
 
-REAL_ESTATE_SORT_LABELS = {
-    "newest": "🆕 Сначала новые",
-    "oldest": "🕰 Сначала старые",
-    "price_asc": "💰⬆️ Дешевле → дороже",
-    "price_desc": "💰⬇️ Дороже → дешевле",
-}
-
-
 def real_estate_city_kb() -> InlineKeyboardMarkup:
     rows = [
         [InlineKeyboardButton(text=label, callback_data=f"re_city:{slug}")]
@@ -204,12 +196,44 @@ def real_estate_deal_kb(city: str) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
-def real_estate_sort_kb(city: str, deal: str) -> InlineKeyboardMarkup:
+def real_estate_filters_kb(city: str, deal: str, price_dir: str, date_dir: str) -> InlineKeyboardMarkup:
+    """Checkbox-style filter panel — price direction and date order are
+    independent and combinable (unlike the old single-choice sort menu).
+
+    price_dir: "a" (cheapest first), "d" (priciest first), or "-" (off).
+    date_dir: "n" (newest first, default) or "o" (oldest first) — always
+    on, since a listing list needs *some* base order even with no price
+    filter active.
+    """
+    def _toggle(dim: str, value: str) -> str:
+        if dim == "price":
+            new_price = "-" if price_dir == value else value
+            return f"re_sort:{city}:{deal}:{new_price}:{date_dir}"
+        new_date = value if date_dir != value else date_dir  # date always has exactly one active value
+        return f"re_sort:{city}:{deal}:{price_dir}:{new_date}"
+
+    def _mark(active: bool) -> str:
+        return "✅" if active else "⬜"
+
     rows = [
-        [InlineKeyboardButton(text=label, callback_data=f"re_sort:{city}:{deal}:{sort}")]
-        for sort, label in REAL_ESTATE_SORT_LABELS.items()
+        [InlineKeyboardButton(
+            text=f"{_mark(price_dir == 'a')} 💰⬆️ Дешевле → дороже",
+            callback_data=_toggle("price", "a"),
+        )],
+        [InlineKeyboardButton(
+            text=f"{_mark(price_dir == 'd')} 💰⬇️ Дороже → дешевле",
+            callback_data=_toggle("price", "d"),
+        )],
+        [InlineKeyboardButton(
+            text=f"{_mark(date_dir != 'o')} 🆕 Сначала новые",
+            callback_data=_toggle("date", "n"),
+        )],
+        [InlineKeyboardButton(
+            text=f"{_mark(date_dir == 'o')} 🕰 Сначала старые",
+            callback_data=_toggle("date", "o"),
+        )],
+        [InlineKeyboardButton(text="◀️ Назад", callback_data=f"re_city:{city}")],
     ]
-    rows.append([InlineKeyboardButton(text="◀️ Назад", callback_data=f"re_city:{city}")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
@@ -713,42 +737,57 @@ async def cb_real_estate_city(callback: CallbackQuery) -> None:
 @dp.callback_query(F.data.startswith("re_deal:"))
 async def cb_real_estate_deal(callback: CallbackQuery) -> None:
     _, city, deal = callback.data.split(":", 2)
-    city_label = REAL_ESTATE_CITY_LABELS.get(city, telegram_text(city))
-    deal_label = REAL_ESTATE_DEAL_LABELS.get(deal, telegram_text(deal))
-    await callback.message.edit_text(
-        f"🏠 <b>{city_label} — {deal_label}</b>\n\nКак отсортировать?",
-        parse_mode="HTML",
-        reply_markup=real_estate_sort_kb(city, deal),
-    )
     await callback.answer()
+    # Default filters: no price sort, newest first — same starting point
+    # as the old single-choice menu's "newest" option.
+    await _show_real_estate_results(callback, city, deal, price_dir="-", date_dir="n")
 
 
 @dp.callback_query(F.data.startswith("re_sort:"))
 async def cb_real_estate_sort(callback: CallbackQuery) -> None:
-    _, city, deal, sort = callback.data.split(":", 3)
+    _, city, deal, price_dir, date_dir = callback.data.split(":", 4)
     await callback.answer()
+    await _show_real_estate_results(callback, city, deal, price_dir, date_dir)
 
+
+def _filters_summary_text(price_dir: str, date_dir: str) -> str:
+    parts = []
+    if price_dir == "a":
+        parts.append("дешевле → дороже")
+    elif price_dir == "d":
+        parts.append("дороже → дешевле")
+    parts.append("сначала старые" if date_dir == "o" else "сначала новые")
+    return ", ".join(parts)
+
+
+async def _show_real_estate_results(
+    callback: CallbackQuery, city: str, deal: str, price_dir: str, date_dir: str,
+) -> None:
+    """Shared by the deal-type step (default filters) and every filter
+    toggle — re-queries and re-renders the listing list for the given
+    filter combination."""
     city_label = REAL_ESTATE_CITY_LABELS.get(city, telegram_text(city))
     deal_label = REAL_ESTATE_DEAL_LABELS.get(deal, telegram_text(deal))
-    sort_label = REAL_ESTATE_SORT_LABELS.get(sort, telegram_text(sort))
+    filters_label = _filters_summary_text(price_dir, date_dir)
+    kb = real_estate_filters_kb(city, deal, price_dir, date_dir)
 
     rows = await database.get_real_estate_listings_filtered(
-        city=city, deal_type=deal, sort=sort, limit=10,
+        city=city, deal_type=deal, price_dir=price_dir, date_dir=date_dir, limit=10,
     )
 
     if not rows:
         await callback.message.edit_text(
             f"🏠 <b>{city_label} — {deal_label}</b>\n\n"
             "📭 Пока нет собранных объявлений под эти фильтры — сборщик "
-            "обновляет базу каждые 6 часов. Попробуйте другой город или "
-            "тип сделки.",
+            "обновляет базу каждые 6 часов. Попробуйте другой город, "
+            "тип сделки или снимите часть фильтров.",
             parse_mode="HTML",
-            reply_markup=real_estate_deal_kb(city),
+            reply_markup=kb,
         )
         return
 
     await callback.message.edit_text(
-        f"🏠 <b>{city_label} — {deal_label}</b>\n{sort_label}\n\nНайдено: {len(rows)}",
+        f"🏠 <b>{city_label} — {deal_label}</b>\n{filters_label}\n\nНайдено: {len(rows)}",
         parse_mode="HTML",
     )
 
@@ -756,8 +795,8 @@ async def cb_real_estate_sort(callback: CallbackQuery) -> None:
         await _send_real_estate_listing(callback.message, row, i)
 
     await callback.message.answer(
-        "Изменить сортировку/фильтры:",
-        reply_markup=real_estate_sort_kb(city, deal),
+        "Фильтры (можно сочетать):",
+        reply_markup=kb,
     )
 
 
