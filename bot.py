@@ -736,11 +736,20 @@ async def cb_real_estate_city(callback: CallbackQuery) -> None:
 
 @dp.callback_query(F.data.startswith("re_deal:"))
 async def cb_real_estate_deal(callback: CallbackQuery) -> None:
+    """Show the filter panel only — no listings yet. Results only appear
+    once the user taps a filter checkbox (cb_real_estate_sort below), so
+    they pick what they want before listings start pouring in."""
     _, city, deal = callback.data.split(":", 2)
     await callback.answer()
-    # Default filters: no price sort, newest first — same starting point
-    # as the old single-choice menu's "newest" option.
-    await _show_real_estate_results(callback, city, deal, price_dir="-", date_dir="n")
+    city_label = REAL_ESTATE_CITY_LABELS.get(city, telegram_text(city))
+    deal_label = REAL_ESTATE_DEAL_LABELS.get(deal, telegram_text(deal))
+    await callback.message.edit_text(
+        f"🏠 <b>{city_label} — {deal_label}</b>\n\n"
+        "Выберите фильтры (можно сочетать) — объявления появятся сразу "
+        "после первого нажатия:",
+        parse_mode="HTML",
+        reply_markup=real_estate_filters_kb(city, deal, "-", "n"),
+    )
 
 
 @dp.callback_query(F.data.startswith("re_sort:"))
