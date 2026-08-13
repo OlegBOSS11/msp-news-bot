@@ -122,8 +122,17 @@ RSS_FEEDS: list[dict[str, str]] = [
 ]
 
 # --- MSP keywords for relevance filtering ---
+# Applied to RAW feed text (parser._score(), before translation) — a
+# Serbian-language article about e.g. visas never gets translated at all
+# unless it scores > 0 here first, so every category below needs Serbian
+# terms alongside the Russian ones, not just real estate (which already
+# had them). Missing this meant Serbian-source articles about visas/ВНЖ/
+# taxes/work/education silently never reached anyone, no matter how
+# relevant, while real-estate articles from the same sources sailed
+# through — verified: "Nove vize za strane radnike u Srbiji" scored 0,
+# "Iznajmljivanje stanova u Beogradu" scored 2, from the same outlet.
 MSP_KEYWORDS: list[str] = [
-    # Сербия и релокация
+    # Сербия и релокация (русские термины)
     "сербия",
     "сербск",
     "релокац",
@@ -133,13 +142,29 @@ MSP_KEYWORDS: list[str] = [
     "внж",
     "пмж",
     "гражданств",
-    # Работа
+    # Сербия и релокация (сербские термины)
+    "srbij",
+    "viz",  # viza/vize/vizu
+    "borav",  # boravak/boravka/boravište/boravišni — case-inflection-safe
+    "državljanstv",
+    "stran",  # stranci/strancu/stranaca — plural genitive drops the "c",
+              # a normal Slavic vowel/consonant alternation "stranci"→"stranaca"
+    "iselj",  # iseljenje — emigration
+    # Работа (русские термины)
     "работа",
     "трудоустро",
     "зарплат",
     "резюме",
     "ваканси",
     "работодател",
+    # Работа (сербские термины)
+    "posao",
+    "poslovi",
+    "zaposlenj",
+    "radno mesto",
+    "radnik",
+    "plata",
+    "poslodavac",
     # Недвижимость (русские термины)
     "недвижим",
     "аренд",
@@ -164,28 +189,49 @@ MSP_KEYWORDS: list[str] = [
     "adaptacija",
     "enterijer",
     "eksterijer",
-    # Образование
+    # Образование (русские термины)
     "образован",
     "школ",
     "университет",
     "учеб",
     "детск",
-    # Финансы
+    # Образование (сербские термины)
+    "škol",
+    "univerzitet",
+    "obrazovanj",
+    "vrtić",  # детский сад
+    "student",
+    # Финансы (русские термины)
     "банк",
     "налог",
     "счет",
     "перевод",
     "валют",
-    # Документы
+    # Финансы (сербские термины)
+    "bank",
+    "porez",
+    "račun",
+    "valut",
+    # Документы (русские термины)
     "документ",
     "паспорт",
     "регистрац",
     "справк",
-    # Новости
+    # Документы (сербские термины)
+    "dokument",
+    "pasoš",
+    "registracij",
+    "potvrd",  # potvrda — справка
+    "dozvola",  # разрешение/справка (шире, чем dozvola za boravak выше)
+    # Новости (русские термины)
     "новост",
     "закон",
     "изменен",
     "ограничен",
+    # Новости (сербские термины)
+    "zakon",
+    "izmen",  # izmena/izmene — изменения
+    "ograničenj",
 ]
 
 # --- News categories for the personalized digest ---
@@ -199,12 +245,14 @@ NEWS_CATEGORIES: dict[str, dict] = {
         "keywords": [
             "сербия", "сербск", "релокац", "переезд", "миграц",
             "виза", "внж", "пмж", "гражданств",
+            "srbij", "viz", "borav", "državljanstv", "stran", "iselj",
         ],
     },
     "work": {
         "label": "💼 Работа",
         "keywords": [
             "работа", "трудоустро", "зарплат", "резюме", "ваканси", "работодател",
+            "posao", "poslovi", "zaposlenj", "radno mesto", "radnik", "plata", "poslodavac",
         ],
     },
     "realestate": {
@@ -217,15 +265,21 @@ NEWS_CATEGORIES: dict[str, dict] = {
     },
     "education": {
         "label": "🎓 Образование",
-        "keywords": ["образован", "школ", "университет", "учеб", "детск"],
+        "keywords": [
+            "образован", "школ", "университет", "учеб", "детск",
+            "škol", "univerzitet", "obrazovanj", "vrtić", "student",
+        ],
     },
     "finance": {
         "label": "💰 Финансы и налоги",
-        "keywords": ["банк", "налог", "счет", "перевод", "валют"],
+        "keywords": ["банк", "налог", "счет", "перевод", "валют", "bank", "porez", "račun", "valut"],
     },
     "documents": {
         "label": "📄 Документы",
-        "keywords": ["документ", "паспорт", "регистрац", "справк"],
+        "keywords": [
+            "документ", "паспорт", "регистрац", "справк",
+            "dokument", "pasoš", "registracij", "potvrd", "dozvola",
+        ],
     },
     "general": {
         "label": "📰 Общие новости",

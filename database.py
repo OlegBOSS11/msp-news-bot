@@ -76,6 +76,11 @@ async def init_db() -> None:
         # subscribed after the item was already broadcast to others) would
         # never see it. Delivery success/failure is tracked per user here,
         # and only written after an actual successful send.
+        cursor = await db.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='user_sent_news'"
+        )
+        user_sent_news_is_new = await cursor.fetchone() is None
+
         await db.execute(
             """
             CREATE TABLE IF NOT EXISTS user_sent_news (
@@ -86,6 +91,34 @@ async def init_db() -> None:
             )
             """
         )
+
+        if user_sent_news_is_new:
+            # One-time migration, the moment this deploys onto a database
+            # that predates per-user tracking: without it, every currently
+            # registered user's `user_sent_news` starts empty, so the very
+            # next digest (including the one-off job that runs on every
+            # process start) would treat everything still inside
+            # collect_news()'s 24h window as brand new and re-send items
+            # already delivered under the old global-only `sent_news` gate.
+            #
+            # The old system never recorded *which* user got *which* link,
+            # only that a link was broadcast at all — so this is a best
+            # effort, not a perfect backfill: it marks every currently
+            # registered user as having already received every link ever
+            # in `sent_news`. That over-approximates for anyone who
+            # subscribed after a given item was broadcast (they'll miss
+            # re-seeing it once, same as before this feature existed) and
+            # under-approximates nothing that matters, since anything
+            # outside the last 24h can never reappear in collect_news()
+            # anyway. Runs only once — user_sent_news_is_new is False on
+            # every subsequent init_db() call.
+            logger.info("Migrating sent_news history into user_sent_news (one-time)...")
+            await db.execute(
+                """
+                INSERT OR IGNORE INTO user_sent_news (user_id, link)
+                SELECT u.user_id, s.link FROM users u CROSS JOIN sent_news s
+                """
+            )
         # Migration: city / deal_type / price_value were added later, for
         # the real-estate menu's filter+sort feature. ALTER TABLE ADD
         # COLUMN is not naturally idempotent in SQLite, so on a database
@@ -301,13 +334,20 @@ async def upsert_real_estate_listing(
 
 
 async def get_real_estate_listings(limit: int = 100) -> list[dict]:
-    """Return the most recently seen real estate listings."""
+    """Return the most recently seen real estate listings.
+
+    Includes city/deal_type — callers doing their own free-text filtering
+    (real_estate.search_real_estate_with_fallback) need these to match a
+    detected city/deal-type signal against structured data, not just the
+    free-text `location` string.
+    """
     try:
         async with aiosqlite.connect(DB_PATH) as db:
             db.row_factory = aiosqlite.Row
             cursor = await db.execute(
                 """
-                SELECT ad_id, title, price, location, url, image_url, source
+                SELECT ad_id, title, price, location, url, image_url, source,
+                       city, deal_type
                 FROM real_estate_listings
                 ORDER BY last_seen DESC
                 LIMIT ?

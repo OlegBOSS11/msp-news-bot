@@ -652,6 +652,62 @@ class TestDatabaseMigrations:
                 tables = {row[0] for row in await cursor.fetchall()}
                 assert {"user_sent_news", "user_disabled_topics", "real_estate_listings"}.issubset(tables)
 
+    @pytest.mark.asyncio
+    async def test_upgrading_from_pre_per_user_db_backfills_history(self, tmp_path):
+        """Deploying per-user delivery tracking onto a database that only
+        ever had the old global `sent_news` must not cause every current
+        subscriber's next digest to re-send everything still inside the
+        24h window — that requires seeding user_sent_news for existing
+        (user, link) pairs from the old broadcast history."""
+        import aiosqlite
+        import database
+
+        db_path = tmp_path / "test.db"
+
+        # Simulate the pre-migration schema: sent_news + users, no
+        # user_sent_news yet (as if this were an existing prod DB).
+        async with aiosqlite.connect(db_path) as db:
+            await db.execute(
+                "CREATE TABLE sent_news (id INTEGER PRIMARY KEY, link TEXT UNIQUE, title TEXT, "
+                "sent TIMESTAMP DEFAULT CURRENT_TIMESTAMP)"
+            )
+            await db.execute("CREATE TABLE users (user_id INTEGER PRIMARY KEY, username TEXT)")
+            await db.execute("INSERT INTO users (user_id) VALUES (111), (222)")
+            await db.execute(
+                "INSERT INTO sent_news (link, title) VALUES "
+                "('https://a.test', 'A'), ('https://b.test', 'B')"
+            )
+            await db.commit()
+
+        with patch("database.DB_PATH", db_path):
+            await database.init_db()  # first run with the new schema
+
+            # Every already-registered user is treated as having already
+            # received every already-broadcast link.
+            assert await database.get_user_sent_links(111) == {"https://a.test", "https://b.test"}
+            assert await database.get_user_sent_links(222) == {"https://a.test", "https://b.test"}
+
+            # Running init_db() again (every subsequent process start)
+            # must not re-run the backfill or disturb real delivery
+            # records written since.
+            await database.mark_user_sent(111, "https://c.test")
+            await database.init_db()
+            assert await database.get_user_sent_links(111) == {
+                "https://a.test", "https://b.test", "https://c.test",
+            }
+
+    @pytest.mark.asyncio
+    async def test_fresh_install_has_nothing_to_backfill(self, tmp_path):
+        """A brand-new database (no pre-existing sent_news history) must
+        not error out on the migration query — CROSS JOIN over two empty
+        tables is a no-op, not a failure."""
+        import database
+
+        db_path = tmp_path / "test.db"
+        with patch("database.DB_PATH", db_path):
+            await database.init_db()
+            assert await database.get_user_sent_links(999) == set()
+
 
 # --- Test 13: combinable real-estate filters (price + date, checkboxes) ---
 
@@ -857,6 +913,268 @@ class TestSearchResultUrls:
         assert results[0].url == "https://n1info.rs/vesti/nesto"
         # The whole point: it must survive as an <a href=...>, not plain text.
         assert telegram_link(results[0].url, "Заголовок").startswith("<a href=")
+
+
+# --- Test 14: SSRF guard for URLInputFile ---
+
+class TestUrlSafety:
+    """URLInputFile.read() fetches through *this server's own* aiohttp
+    session (aiogram internals), not Telegram's — an unfiltered image_url
+    from a scraped listing or RSS feed could reach this server's private
+    network otherwise."""
+
+    @pytest.mark.asyncio
+    async def test_rejects_non_http_scheme(self):
+        from url_safety import is_safe_to_fetch
+
+        assert await is_safe_to_fetch("file:///etc/passwd") is False
+        assert await is_safe_to_fetch("ftp://example.com/x") is False
+        assert await is_safe_to_fetch("not a url") is False
+
+    @pytest.mark.asyncio
+    async def test_rejects_literal_loopback_and_private_ips(self):
+        from url_safety import is_safe_to_fetch
+
+        for url in (
+            "http://127.0.0.1/secret",
+            "http://127.0.0.1:8080/",
+            "http://169.254.169.254/latest/meta-data/",  # cloud metadata
+            "http://10.0.0.5/",
+            "http://192.168.1.1/",
+            "http://[::1]/",
+        ):
+            assert await is_safe_to_fetch(url) is False, url
+
+    @pytest.mark.asyncio
+    async def test_rejects_localhost_hostnames(self):
+        from url_safety import is_safe_to_fetch
+
+        assert await is_safe_to_fetch("http://localhost/x") is False
+        assert await is_safe_to_fetch("http://foo.localhost/x") is False
+        assert await is_safe_to_fetch("http://printer.local/x") is False
+
+    @pytest.mark.asyncio
+    async def test_accepts_literal_public_ip(self):
+        from url_safety import is_safe_to_fetch
+
+        assert await is_safe_to_fetch("http://93.184.216.34/x") is True
+
+    @pytest.mark.asyncio
+    async def test_hostname_resolving_to_private_ip_is_rejected(self):
+        """A domain name is only safe if what it *resolves to* is public —
+        not just because it isn't a literal IP itself."""
+        from url_safety import is_safe_to_fetch
+
+        fake_getaddrinfo = MagicMock(return_value=[
+            (2, 1, 6, "", ("127.0.0.1", 0)),
+        ])
+        with patch("socket.getaddrinfo", fake_getaddrinfo):
+            assert await is_safe_to_fetch("http://evil.example.com/x") is False
+
+    @pytest.mark.asyncio
+    async def test_hostname_resolving_to_public_ip_is_accepted(self):
+        from url_safety import is_safe_to_fetch
+
+        fake_getaddrinfo = MagicMock(return_value=[
+            (2, 1, 6, "", ("93.184.216.34", 0)),
+        ])
+        with patch("socket.getaddrinfo", fake_getaddrinfo):
+            assert await is_safe_to_fetch("http://cdn.example.com/x") is True
+
+    @pytest.mark.asyncio
+    async def test_dns_failure_is_rejected_not_raised(self):
+        import socket as socket_module
+        from url_safety import is_safe_to_fetch
+
+        with patch("socket.getaddrinfo", side_effect=socket_module.gaierror("no such host")):
+            assert await is_safe_to_fetch("http://does-not-exist.invalid/x") is False
+
+    @pytest.mark.asyncio
+    async def test_digest_photo_skips_unsafe_url_falls_back_to_text(self):
+        """_send_digest_item must not even attempt URLInputFile on an
+        unsafe image_url — falls straight to the text-only send."""
+        from bot import _send_digest_item
+
+        item = {
+            "title": "T", "source": "s", "link": "https://e.com/a",
+            "summary": "x", "image_url": "http://127.0.0.1/pwn",
+        }
+        with patch("bot.bot.send_photo", new_callable=AsyncMock) as mock_photo:
+            with patch("bot.bot.send_message", new_callable=AsyncMock) as mock_text:
+                ok = await _send_digest_item(111, 1, item)
+                assert ok is True
+                mock_photo.assert_not_called()
+                mock_text.assert_awaited_once()
+
+
+# --- Test 15: 4096-char Telegram message limit ---
+
+class TestMessageSplitting:
+    """GigaChat answers and search-with-sources text have no fixed upper
+    bound; Telegram's sendMessage limit is 4096 chars and rejects longer
+    text outright rather than truncating it."""
+
+    def test_short_text_is_a_single_chunk(self):
+        from telegram_format import split_telegram_message
+
+        assert split_telegram_message("hello") == ["hello"]
+
+    def test_long_plain_text_splits_under_limit(self):
+        from telegram_format import split_telegram_message
+
+        chunks = split_telegram_message("x" * 10000)
+        assert "".join(chunks) == "x" * 10000
+        assert all(len(c) <= 4096 for c in chunks)
+        assert len(chunks) > 1
+
+    def test_never_splits_inside_a_tag(self):
+        """Sweep the split boundary through and around an <a href> tag —
+        it must always land outside the tag, and content must survive
+        intact either way."""
+        from telegram_format import split_telegram_message
+
+        for pad in range(0, 30):
+            text = "x" * (4096 - 10 + pad) + '<a href="https://example.com/x">click here</a>' + "y" * 50
+            chunks = split_telegram_message(text)
+            assert "".join(chunks) == text, f"pad={pad}: content mismatch"
+            assert all(len(c) <= 4096 for c in chunks), f"pad={pad}: over limit"
+            for c in chunks:
+                assert c.count("<") == c.count(">"), f"pad={pad}: unbalanced <> in {c[-40:]!r}"
+
+    def test_format_answer_with_sources_over_limit_still_splits_cleanly(self):
+        from telegram_format import split_telegram_message
+        from serbia_search import format_answer_with_sources, SearchResult
+
+        sources = [SearchResult(title=f"Источник {i}" * 5, url=f"https://example.com/{i}") for i in range(5)]
+        answer = format_answer_with_sources("A" * 4200, sources)
+        chunks = split_telegram_message(answer)
+        assert "".join(chunks) == answer
+        assert all(len(c) <= 4096 for c in chunks)
+        assert len(chunks) > 1
+
+    @pytest.mark.asyncio
+    async def test_send_long_text_splits_across_multiple_messages(self):
+        from bot import _send_long_text
+
+        message = AsyncMock()
+        await _send_long_text(message, "x" * 9000, parse_mode="HTML")
+        assert message.answer.await_count > 1
+        total = sum(len(c.args[0]) for c in message.answer.await_args_list)
+        assert total == 9000
+
+    @pytest.mark.asyncio
+    async def test_send_long_text_reply_markup_only_on_last_chunk(self):
+        from bot import _send_long_text
+
+        message = AsyncMock()
+        sentinel_markup = object()
+        await _send_long_text(message, "x" * 9000, reply_markup=sentinel_markup)
+        calls = message.answer.await_args_list
+        assert len(calls) > 1
+        for call in calls[:-1]:
+            assert call.kwargs["reply_markup"] is None
+        assert calls[-1].kwargs["reply_markup"] is sentinel_markup
+
+    @pytest.mark.asyncio
+    async def test_send_long_text_short_text_single_call(self):
+        from bot import _send_long_text
+
+        message = AsyncMock()
+        await _send_long_text(message, "hello", reply_markup="kb")
+        message.answer.assert_awaited_once_with("hello", reply_markup="kb")
+
+
+# --- Test 16: real-estate free-text search filtering ---
+
+_FAKE_LISTING_ROWS = [
+    {"ad_id": "1", "title": "Квартира в Белграде", "url": "https://x/prodaja/1",
+     "price": "100000", "location": "Beograd, Vračar", "source": "HaloOglasi",
+     "image_url": None, "city": "beograd", "deal_type": "sale"},
+    {"ad_id": "2", "title": "Kuća u Novom Sadu", "url": "https://x/prodaja/2",
+     "price": "150000", "location": "Novi Sad, Grbavica", "source": "HaloOglasi",
+     "image_url": None, "city": "novi-sad", "deal_type": "sale"},
+    {"ad_id": "3", "title": "Stan za izdavanje Novi Sad", "url": "https://x/iznajmljivanje/3",
+     "price": "400", "location": "Novi Sad, Centar", "source": "HaloOglasi",
+     "image_url": None, "city": "novi-sad", "deal_type": "rent"},
+    {"ad_id": "4", "title": "Stan na prodaju Beograd", "url": "https://x/prodaja/4",
+     "price": "90000", "location": "Beograd, Novi Beograd", "source": "HaloOglasi",
+     "image_url": None, "city": "beograd", "deal_type": "sale"},
+    {"ad_id": "5", "title": "Kuća za izdavanje Beograd", "url": "https://x/iznajmljivanje/5",
+     "price": "600", "location": "Beograd, Zemun", "source": "HaloOglasi",
+     "image_url": None, "city": "beograd", "deal_type": "rent"},
+    {"ad_id": "6", "title": "Stan za izdavanje Beograd", "url": "https://x/iznajmljivanje/6",
+     "price": "500", "location": "Beograd, Zvezdara", "source": "HaloOglasi",
+     "image_url": None, "city": "beograd", "deal_type": "rent"},
+]
+
+
+class TestRealEstateFreeTextSearch:
+    """search_real_estate_with_fallback()'s DB-backed path used to match
+    the *whole query phrase* verbatim against the title (almost never
+    hits real listing text) and PREDEFINED_LISTINGS used an if/elif chain
+    where matching *any one* signal (e.g. property type) included a
+    listing regardless of the others (e.g. deal type)."""
+
+    @pytest.mark.asyncio
+    async def test_city_and_type_combine_correctly(self):
+        """"покажи дом в Нови-Саде" must return only the Novi Sad house,
+        not an unrelated Belgrade apartment or a Novi Sad apartment."""
+        from real_estate import search_real_estate_with_fallback
+
+        with patch("database.get_real_estate_listings", new=AsyncMock(return_value=_FAKE_LISTING_ROWS)):
+            listings, _ = await search_real_estate_with_fallback("покажи дом в Нови-Саде")
+            assert [listing.ad_id for listing in listings] == ["2"]
+
+    @pytest.mark.asyncio
+    async def test_deal_type_filters_out_the_other_deal_type(self):
+        """"купить квартиру" (buy an apartment) must exclude rentals, even
+        rental *apartments* — deal type and property type both apply."""
+        from real_estate import search_real_estate_with_fallback
+
+        with patch("database.get_real_estate_listings", new=AsyncMock(return_value=_FAKE_LISTING_ROWS)):
+            listings, _ = await search_real_estate_with_fallback("купить квартиру")
+            ad_ids = {listing.ad_id for listing in listings}
+            assert ad_ids == {"1", "4"}  # both sale apartments
+            assert all(listing.deal_type == "sale" for listing in listings)
+
+    @pytest.mark.asyncio
+    async def test_rent_only_query_excludes_sale(self):
+        from real_estate import search_real_estate_with_fallback
+
+        with patch("database.get_real_estate_listings", new=AsyncMock(return_value=_FAKE_LISTING_ROWS)):
+            listings, _ = await search_real_estate_with_fallback("снять квартиру в Белграде")
+            ad_ids = {listing.ad_id for listing in listings}
+            assert ad_ids == {"6"}  # Stan za izdavanje Beograd (rental apartment)
+
+    @pytest.mark.asyncio
+    async def test_no_recognizable_signal_falls_back_to_substring(self):
+        """A query this filter doesn't model (e.g. a neighborhood name)
+        should still find something via plain substring match, not
+        return nothing."""
+        from real_estate import search_real_estate_with_fallback
+
+        with patch("database.get_real_estate_listings", new=AsyncMock(return_value=_FAKE_LISTING_ROWS)):
+            listings, _ = await search_real_estate_with_fallback("Vračar")
+            assert [listing.ad_id for listing in listings] == ["1"]
+
+    def test_predefined_listings_and_combines_type_and_deal(self):
+        """Same AND-combination bug, but in the PREDEFINED_LISTINGS
+        fallback path's filter (no live 'listings' fixture needed — this
+        hits the shared helper directly)."""
+        from real_estate import _listing_matches_query_filters
+
+        # A rental apartment: is_apartment matches, but is_buy was also
+        # requested and this listing doesn't satisfy it — must be excluded.
+        assert _listing_matches_query_filters(
+            title_lower="stan za izdavanje", url_lower="https://x/iznajmljivanje/1",
+            is_house=False, is_apartment=True, is_buy=True, is_rent=False,
+        ) is False
+
+        # A sale apartment: both signals satisfied — included.
+        assert _listing_matches_query_filters(
+            title_lower="stan na prodaju", url_lower="https://x/prodaja/1",
+            is_house=False, is_apartment=True, is_buy=True, is_rent=False,
+        ) is True
 
 
 if __name__ == "__main__":

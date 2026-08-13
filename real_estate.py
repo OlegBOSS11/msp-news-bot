@@ -59,6 +59,56 @@ HALOOGLASI_COLLECTOR_URLS = [
     for slug, deal_type in HALOOGLASI_DEALS
 ]
 
+# Common Cyrillic/Latin spellings a user might type -> HALOOGLASI_CITIES slug.
+QUERY_CITY_ALIASES: dict[str, str] = {
+    "белград": "beograd", "beograd": "beograd", "belgrade": "beograd",
+    "нови-сад": "novi-sad", "нови сад": "novi-sad", "novi sad": "novi-sad", "novi-sad": "novi-sad",
+    "ниш": "nis", "nis": "nis", "niš": "nis",
+    "крагуевац": "kragujevac", "kragujevac": "kragujevac",
+}
+
+# Property-type / deal-type signals in a free-text query. Compiled once at
+# import time and shared by every free-text filter below them, so
+# "квартира"/"дом"/"купить"/"аренда" mean the same thing everywhere in
+# this module — word stems handle Russian inflection (дом/дома/домов),
+# with a negative lookbehind so "дом" doesn't match inside "рядом".
+_HOUSE_RE = re.compile(r'(?<![а-яё])дом(?:а|ов|е|ый|ой|ашн)?(?=\s|$)|коттедж|вилл|villa|house|kuća')
+_APARTMENT_RE = re.compile(r'(?<![а-яё])квартир(?:а|ы|у|е|ой|ам)?(?=\s|$)|студи(?:я|и|ю|ей)?(?=\s|$)|апартамент|stan|apartment')
+_BUY_QUERY_RE = re.compile(r'купить|покупк(?:а|и|у|е|ой)?|продаж(?:а|и|у|е|ой)?|prodaja|buy')
+_RENT_QUERY_RE = re.compile(r'аренд(?:а|ы|у|е|ой)?|снять|iznajmljiv(?:anje|ati)?|rent')
+
+
+def _detect_query_city(query_lower: str) -> str | None:
+    """Best-effort city slug from a free-text query, or None if none of
+    the known cities/aliases are mentioned."""
+    for alias, slug in QUERY_CITY_ALIASES.items():
+        if alias in query_lower:
+            return slug
+    return None
+
+
+def _listing_matches_query_filters(
+    title_lower: str, url_lower: str,
+    is_house: bool, is_apartment: bool, is_buy: bool, is_rent: bool,
+) -> bool:
+    """AND-combine every signal actually present in the query — a signal
+    that's False (not mentioned) is a no-op, but ones that ARE present
+    must ALL agree. This used to be an if/elif chain, where matching
+    *any one* signal (e.g. property type) included the listing regardless
+    of the others (e.g. deal type) — "купить квартиру" (buy an apartment)
+    would pull in rentals too, as long as they were apartments, because
+    the elif for is_buy never even ran once is_apartment's branch matched.
+    """
+    if is_house and not (_HOUSE_RE.search(title_lower) or "/kuce/" in url_lower or "/kuce-" in url_lower):
+        return False
+    if is_apartment and not (_APARTMENT_RE.search(title_lower) or "/stanovi/" in url_lower):
+        return False
+    if is_buy and not ("покупк" in title_lower or "продаж" in title_lower or "/prodaja/" in url_lower):
+        return False
+    if is_rent and not ("аренд" in title_lower or "iznajmljiv" in title_lower or "/iznajmljivanje/" in url_lower):
+        return False
+    return True
+
 
 @dataclass
 class PropertyListing:
@@ -656,18 +706,60 @@ async def search_real_estate_with_fallback(query: str = "") -> tuple[list[Proper
                 location=row["location"],
                 source=row["source"],
                 image_url=row["image_url"],
+                city=row["city"] or "",
+                deal_type=row["deal_type"] or "",
             )
             for row in db_rows
         ]
         if query:
             query_lower = query.lower()
-            matched = [
-                listing for listing in db_listings
-                if query_lower in listing.title.lower()
-                or (listing.location and query_lower in listing.location.lower())
-            ]
-            if matched:
-                db_listings = matched
+            # Matching the query as one whole substring against the title
+            # basically never hits real listing text ("покажи дом в
+            # нови-саде" doesn't literally appear anywhere) — extract the
+            # actual signals (city/type/deal) instead and AND them.
+            city = _detect_query_city(query_lower)
+            is_house = bool(_HOUSE_RE.search(query_lower))
+            is_apartment = bool(_APARTMENT_RE.search(query_lower))
+            is_buy = bool(_BUY_QUERY_RE.search(query_lower))
+            is_rent = bool(_RENT_QUERY_RE.search(query_lower))
+
+            def _city_matches(listing: PropertyListing) -> bool:
+                if not city:
+                    return True
+                if listing.city == city:  # structured field, e.g. "novi-sad"
+                    return True
+                # Free-text `location` ("Novi Sad, Grbavica") uses a space
+                # where the city slug uses a hyphen — normalize before
+                # comparing, or "novi-sad" never matches "novi sad, ...".
+                return bool(listing.location) and city.replace("-", " ") in listing.location.lower()
+
+            if city or is_house or is_apartment or is_buy or is_rent:
+                matched = [
+                    listing for listing in db_listings
+                    if _city_matches(listing)
+                    and _listing_matches_query_filters(
+                        listing.title.lower(), listing.url.lower(),
+                        is_house, is_apartment, is_buy, is_rent,
+                    )
+                ]
+                if matched:
+                    db_listings = matched
+            else:
+                # No recognizable signal in the query at all — fall back
+                # to a plain substring match rather than showing nothing
+                # for a query about something this filter doesn't model
+                # (e.g. a neighborhood name, a price). Checked first, not
+                # as an "elif matched is empty" branch: with no signals,
+                # the signal-based filter above would trivially match
+                # every listing (nothing to disagree with), so it would
+                # never even fall through to this branch otherwise.
+                substring_matched = [
+                    listing for listing in db_listings
+                    if query_lower in listing.title.lower()
+                    or (listing.location and query_lower in listing.location.lower())
+                ]
+                if substring_matched:
+                    db_listings = substring_matched
         return db_listings[:15], False
 
     # DB not populated yet (e.g. collector hasn't run) — try a live scrape.
@@ -680,37 +772,27 @@ async def search_real_estate_with_fallback(query: str = "") -> tuple[list[Proper
         listings = PREDEFINED_LISTINGS
         is_predefined = True
 
-        # Filter predefined listings based on query keywords
+        # Filter predefined listings based on query keywords. AND-combines
+        # every signal actually present in the query (see
+        # _listing_matches_query_filters) — this used to be an if/elif
+        # chain, where matching *any one* signal included the listing
+        # regardless of the others: "купить квартиру" (buy an apartment)
+        # pulled in rentals too, as long as they were apartments, since
+        # the elif checking is_buy never ran once is_apartment matched.
         if query:
             query_lower = query.lower()
-            filtered = []
+            is_house = bool(_HOUSE_RE.search(query_lower))
+            is_apartment = bool(_APARTMENT_RE.search(query_lower))
+            is_buy = bool(_BUY_QUERY_RE.search(query_lower))
+            is_rent = bool(_RENT_QUERY_RE.search(query_lower))
 
-            # Determine what type of property the user is looking for
-            # Match word stems to handle Russian word forms (дом, дома, домов, etc.)
-            # Use negative lookbehind to avoid matching inside words (e.g. "дом" in "рядом")
-            import re
-            is_house = bool(re.search(r'(?<![а-яё])дом(?:а|ов|е|ый|ой|ашн)?(?=\s|$)|коттедж|вилл|villa|house|kuća', query_lower))
-            is_apartment = bool(re.search(r'(?<![а-яё])квартир(?:а|ы|у|е|ой|ам)?(?=\s|$)|студи(?:я|и|ю|ей)?(?=\s|$)|апартамент|stan|apartment', query_lower))
-            is_buy = bool(re.search(r'купить|покупк(?:а|и|у|е|ой)?|продаж(?:а|и|у|е|ой)?|prodaja|buy', query_lower))
-            is_rent = bool(re.search(r'аренд(?:а|ы|у|е|ой)?|снять|изнajmljiv(?:anje|ati)?|rent', query_lower))
-
-            for listing in listings:
-                title_lower = listing.title.lower()
-                url_lower = listing.url.lower()
-
-                # Check if listing matches the query type
-                # Use regex with negative lookbehind for title matching to avoid false positives
-                if is_house and (re.search(r'(?<![а-яё])дом(?:а|ов|е|ый|ой|ашн)?(?=\s|$)|коттедж|вилл|villa', title_lower) or "/kuce/" in url_lower or "/kuce-" in url_lower):
-                    filtered.append(listing)
-                elif is_apartment and (re.search(r'(?<![а-яё])квартир(?:а|ы|у|е|ой|ам)?(?=\s|$)|студи(?:я|и|ю|ей)?(?=\s|$)', title_lower) or "/stanovi/" in url_lower):
-                    filtered.append(listing)
-                elif is_buy and ("покупк" in title_lower or "продаж" in title_lower or "/prodaja/" in url_lower):
-                    filtered.append(listing)
-                elif is_rent and ("аренд" in title_lower or "изнajmljiv" in title_lower or "/iznajmljivanje/" in url_lower):
-                    filtered.append(listing)
-                elif not is_house and not is_apartment and not is_buy and not is_rent:
-                    # No specific filter, show all
-                    filtered.append(listing)
+            filtered = [
+                listing for listing in listings
+                if _listing_matches_query_filters(
+                    listing.title.lower(), listing.url.lower(),
+                    is_house, is_apartment, is_buy, is_rent,
+                )
+            ]
 
             # If nothing matched specific filters, show all
             if filtered:

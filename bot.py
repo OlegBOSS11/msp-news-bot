@@ -37,8 +37,9 @@ from real_estate import (
     refresh_real_estate_database,
 )
 from serbia_search import get_serbia_answer
-from telegram_format import telegram_link, telegram_text
+from telegram_format import split_telegram_message, telegram_link, telegram_text
 from translator import translate_to_russian, detect_language
+from url_safety import is_safe_to_fetch
 
 logging.basicConfig(
     level=logging.INFO,
@@ -342,9 +343,10 @@ async def _send_digest_item(chat_id: int, idx: int, item: dict) -> bool:
     uses this to decide whether to record it as delivered.
     """
     caption = _digest_item_caption(idx, item)
-    if item.get("image_url"):
+    image_url = item.get("image_url")
+    if image_url and await is_safe_to_fetch(image_url):
         try:
-            photo = URLInputFile(item["image_url"])
+            photo = URLInputFile(image_url)
             await bot.send_photo(chat_id=chat_id, photo=photo, caption=caption, parse_mode="HTML")
             return True
         except Exception as exc:
@@ -545,7 +547,7 @@ async def cmd_status(message: Message) -> None:
         "📊 <b>Статус бота:</b>\n\n"
         f"✅ Бот работает\n"
         f"🕐 Текущее время: {now.strftime('%H:%M %d.%m.%Y')} (МСК)\n"
-        f"📰 Всего новостей отправлено: {stats['total']}\n"
+        f"📰 Всего новостей в базе: {stats['total']}\n"
         f"📅 За сегодня: {stats['today']}\n"
         f"⏰ Последняя отправка: {stats['last_sent'] or 'нет'}\n"
         f"🔔 Следующая сводка: в 18:00 МСК",
@@ -638,7 +640,7 @@ async def cb_status(callback: CallbackQuery) -> None:
         "📊 <b>Статус бота:</b>\n\n"
         f"✅ Бот работает\n"
         f"🕐 Текущее время: {now.strftime('%H:%M %d.%m.%Y')} (МСК)\n"
-        f"📰 Всего новостей отправлено: {stats['total']}\n"
+        f"📰 Всего новостей в базе: {stats['total']}\n"
         f"📅 За сегодня: {stats['today']}\n"
         f"⏰ Последняя отправка: {stats['last_sent'] or 'нет'}\n"
         f"🔔 Следующая сводка: в 18:00 МСК",
@@ -709,7 +711,7 @@ async def _send_real_estate_listing(message: Message, row: dict, idx: int) -> No
         f"📍 {location}\n"
         f"🔗 {link}"
     )
-    if row["image_url"]:
+    if row["image_url"] and await is_safe_to_fetch(row["image_url"]):
         try:
             photo = URLInputFile(row["image_url"])
             await message.answer_photo(photo=photo, caption=caption, parse_mode="HTML")
@@ -813,6 +815,21 @@ async def _safe_edit_text(message: Message, text: str, **kwargs) -> None:
         if "message is not modified" not in str(exc):
             raise
         logger.debug("edit_text skipped — content unchanged")
+
+
+async def _send_long_text(message: Message, text: str, **kwargs) -> None:
+    """message.answer(), but split across multiple messages if `text`
+    exceeds Telegram's 4096-char limit — GigaChat answers and
+    search-with-sources text have no fixed upper bound, and sending a
+    longer string as one message fails outright rather than truncating.
+    `reply_markup` (if passed) is only attached to the last chunk, so a
+    long answer doesn't get the menu keyboard repeated after every part.
+    """
+    chunks = split_telegram_message(text)
+    reply_markup = kwargs.pop("reply_markup", None)
+    for i, chunk in enumerate(chunks):
+        is_last = i == len(chunks) - 1
+        await message.answer(chunk, reply_markup=reply_markup if is_last else None, **kwargs)
 
 
 async def _show_real_estate_results(
@@ -949,7 +966,7 @@ async def handle_question(message: Message) -> None:
                         f"🔗 {telegram_link(listing.url, 'Подробнее')}"
                     )
 
-                    if listing.image_url:
+                    if listing.image_url and await is_safe_to_fetch(listing.image_url):
                         try:
                             photo = URLInputFile(listing.image_url)
                             await message.answer_photo(
@@ -1029,7 +1046,7 @@ async def handle_question(message: Message) -> None:
     # Save bot response to conversation history
     await database.save_message(user_id, "assistant", answer)
 
-    await message.answer(answer, reply_markup=main_menu_kb(), parse_mode="HTML", disable_web_page_preview=True)
+    await _send_long_text(message, answer, reply_markup=main_menu_kb(), parse_mode="HTML", disable_web_page_preview=True)
 
 
 # --- Voice message handler ---
@@ -1129,7 +1146,7 @@ async def handle_voice(message: Message) -> None:
     # Save bot response to conversation history
     await database.save_message(user_id, "assistant", answer)
 
-    await message.answer(answer, reply_markup=main_menu_kb())
+    await _send_long_text(message, answer, reply_markup=main_menu_kb())
 
 
 # --- Main ---
