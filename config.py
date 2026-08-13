@@ -15,7 +15,9 @@ GIGACHAT_CREDENTIALS: str = os.environ["GIGACHAT_CREDENTIALS"]
 TELEGRAM_PROXY_URL: str | None = os.environ.get("TELEGRAM_PROXY_URL") or None
 
 # --- Serbian news sources (for translation) ---
-SERBIAN_NEWS_SOURCES: list[str] = ["n1info.rs", "blic.rs", "telegraf.rs", "b92.net", "kurir.rs"]
+SERBIAN_NEWS_SOURCES: list[str] = [
+    "n1info.rs", "blic.rs", "telegraf.rs", "b92.net", "kurir.rs", "danas.rs", "nova.rs",
+]
 
 # --- Whitelist domains (only these are parsed) ---
 WHITELIST_DOMAINS: set[str] = {
@@ -31,10 +33,13 @@ WHITELIST_DOMAINS: set[str] = {
     "investserbia.org",
     "telegraf.rs",
     "kurir.rs",
+    "danas.rs",
+    "nova.rs",
     # Русскоязычные источники о Сербии
     "serbiarus.com",
     "rsmedia.ru",
     "ruserbia.com",
+    "russian.rs",  # Русская диаспора Сербии — гайды и новости по релокации
     # Международные источники
     "reuters.com",
     "bbc.com",
@@ -71,10 +76,22 @@ RSS_FEEDS: list[dict[str, str]] = [
         "name": "kurir.rs",
         "url": "https://www.kurir.rs/rss/",
     },
+    {
+        "name": "danas.rs",
+        "url": "https://danas.rs/feed/",
+    },
+    {
+        "name": "nova.rs",
+        "url": "https://nova.rs/feed/",
+    },
     # --- Русскоязычные источники о Сербии ---
     {
         "name": "ruserbia.com",
         "url": "https://ruserbia.com/feed/",
+    },
+    {
+        "name": "russian.rs",
+        "url": "https://russian.rs/feed/",
     },
     # --- Международные источники ---
     {

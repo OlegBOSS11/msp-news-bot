@@ -260,7 +260,10 @@ async def collect_news() -> list[dict]:
         text = (e.get("title", "") + " " + e.get("summary", "")).lower()
         # Serbian sources (and Serbia-focused portals) always pass,
         # general Russian/international sources must mention Serbia terms
-        if e["source"] in ["n1info.rs", "blic.rs", "b92.net", "telegraf.rs", "kurir.rs", "ruserbia.com"]:
+        if e["source"] in [
+            "n1info.rs", "blic.rs", "b92.net", "telegraf.rs", "kurir.rs",
+            "danas.rs", "nova.rs", "ruserbia.com", "russian.rs",
+        ]:
             filtered.append(e)
         elif any(term in text for term in SERBIA_REQUIRED_TERMS):
             filtered.append(e)
@@ -280,6 +283,8 @@ async def collect_news() -> list[dict]:
         "serbia.travel": 0,
         "investserbia.org": 0,
         "kurir.rs": 0,
+        "danas.rs": 0,
+        "nova.rs": 0,
         # Международные источники
         "reuters.com": 1,
         "bbc.com": 1,
@@ -297,6 +302,7 @@ async def collect_news() -> list[dict]:
         "serbiarus.com": 1,
         "rsmedia.ru": 1,
         "ruserbia.com": 1,
+        "russian.rs": 1,
     }
     relevant.sort(
         key=lambda e: (-e["score"], source_priority.get(e["source"], 9)),
