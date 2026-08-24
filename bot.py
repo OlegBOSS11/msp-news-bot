@@ -283,21 +283,8 @@ async def _prepare_digest_items(fresh: list[dict]) -> list[dict]:
         if source in config.SERBIAN_NEWS_SOURCES:
             if detect_language(title) == "serbian":
                 title = await translate_to_russian(title)
-                # GoogleTranslator (deep-translator) scrapes
-                # translate.google.com/m with no delay between calls —
-                # firing title+summary for every Serbian item in this
-                # loop back-to-back is exactly the pattern that trips
-                # Google's abuse/rate-limit detection for that endpoint
-                # (seen in production: every item's title came back as
-                # Google's own error page — caught by the Cyrillic-ratio
-                # check in translate_to_russian(), but better to not
-                # trigger it in the first place). Same "be polite between
-                # requests" pattern already used by the real-estate
-                # collector.
-                await asyncio.sleep(0.5)
             if detect_language(summary) == "serbian":
                 summary = await translate_to_russian(summary)
-                await asyncio.sleep(0.5)
 
         prepared.append({
             "title": title,

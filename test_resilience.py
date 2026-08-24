@@ -1179,36 +1179,64 @@ class TestRealEstateFreeTextSearch:
 
 # --- Test 17: Google Translate returning its own error page as "translated" text ---
 
+def _mock_giga_returning(text: str) -> MagicMock:
+    """A fake GigaChat client whose achat() returns `text` as the reply."""
+    mock_response = MagicMock()
+    mock_response.choices[0].message.content = text
+    mock_giga = MagicMock()
+    mock_giga.achat = AsyncMock(return_value=mock_response)
+    return mock_giga
+
+
 class TestTranslationSanity:
-    """deep-translator's GoogleTranslator scrapes translate.google.com
-    rather than calling an official API — when Google returns an error
-    page, it doesn't always raise: it can hand back the error page's own
-    text as a "successful" translation. Seen in production: every digest
-    item's title came back as Google's literal "Error 500 (Server
-    Error)!! ...That's all we know." boilerplate."""
+    """translate_to_russian() used to scrape translate.google.com via
+    deep-translator's GoogleTranslator — switched to GigaChat after Google
+    started returning its own error page (HTTP 200, so the old status-code
+    check never caught it) as if it were the translation, verbatim, in
+    production: "Error 500 (Server Error)!! ...That's all we know."
+
+    The sanity check below (translation should be mostly Cyrillic) is kept
+    as defense in depth against GigaChat wandering off-format too, not
+    because it has the same failure mode as the old scraper."""
 
     @pytest.mark.asyncio
-    async def test_google_error_page_is_discarded_not_used(self):
+    async def test_non_russian_reply_is_discarded_not_used(self):
         from translator import translate_to_russian
 
         garbage = (
             "Error 500 (Server Error)!!1500.That's an error."
             "There was an error. Please try again later.That's all we know."
         )
-        with patch("translator._translate_sync", return_value=garbage):
+        with patch("translator.get_gigachat_client", return_value=_mock_giga_returning(garbage)):
             result = await translate_to_russian("Nove vize za strane radnike u Srbiji")
             assert result == "Nove vize za strane radnike u Srbiji"
 
     @pytest.mark.asyncio
-    async def test_real_russian_translation_still_passes_through(self):
+    async def test_real_russian_translation_passes_through(self):
         from translator import translate_to_russian
 
-        with patch(
-            "translator._translate_sync",
-            return_value="Новые визы для иностранных работников в Сербии",
-        ):
+        giga = _mock_giga_returning("Новые визы для иностранных работников в Сербии")
+        with patch("translator.get_gigachat_client", return_value=giga):
             result = await translate_to_russian("Nove vize za strane radnike u Srbiji")
             assert result == "Новые визы для иностранных работников в Сербии"
+
+    @pytest.mark.asyncio
+    async def test_gigachat_unavailable_falls_back_to_original(self):
+        from translator import translate_to_russian
+
+        with patch("translator.get_gigachat_client", return_value=None):
+            result = await translate_to_russian("Nove vize za strane radnike u Srbiji")
+            assert result == "Nove vize za strane radnike u Srbiji"
+
+    @pytest.mark.asyncio
+    async def test_gigachat_exception_falls_back_to_original(self):
+        from translator import translate_to_russian
+
+        mock_giga = MagicMock()
+        mock_giga.achat = AsyncMock(side_effect=Exception("timeout"))
+        with patch("translator.get_gigachat_client", return_value=mock_giga):
+            result = await translate_to_russian("Nove vize za strane radnike u Srbiji")
+            assert result == "Nove vize za strane radnike u Srbiji"
 
 
 if __name__ == "__main__":

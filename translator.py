@@ -1,23 +1,41 @@
-"""Translation module for Serbian news to Russian."""
+"""Translation module for Serbian news to Russian.
+
+Was deep-translator's GoogleTranslator (scrapes translate.google.com) —
+switched to GigaChat. That scraper turned out to be unreliably blocked for
+this server's IP: Google would return its own error page with an outer
+HTTP 200 (so deep-translator's status-code check never caught it) and the
+page's own "Error 500 (Server Error)!! ...That's all we know." boilerplate
+got returned as if it were the translation — seen verbatim in production.
+A polite delay between requests didn't help (checked days later, still
+failing for most items), meaning it's a standing block, not a rate limit.
+GigaChat is already a hard dependency of this bot (used for every Q&A
+answer) and reachable reliably from this server, so it has no separate
+failure mode to work around, and drops deep-translator (with its own
+unresolved supply-chain advisory, see CONTRIBUTING.md history) entirely.
+"""
 
 from __future__ import annotations
 
-import asyncio
 import logging
 
-from deep_translator import GoogleTranslator
-from deep_translator.exceptions import BaseError as TranslationError
+from gigachat.models.chat import Chat, Messages
+
+from gigachat_client import get_gigachat_client
 
 logger = logging.getLogger(__name__)
 
-
-def _translate_sync(text: str) -> str:
-    """Blocking call to Google Translate (via deep-translator). Run in a thread."""
-    return GoogleTranslator(source="auto", target="ru").translate(text)
+_TRANSLATE_SYSTEM_PROMPT = (
+    "Ты профессиональный переводчик с сербского на русский язык. "
+    "Переведи текст пользователя на русский. Ответь ТОЛЬКО переводом, "
+    "без кавычек, пояснений, комментариев или каких-либо добавлений. "
+    "Сохрани исходный смысл и стиль (заголовок остаётся заголовком, "
+    "обычный текст — обычным текстом). Если текст уже на русском — "
+    "верни его без изменений."
+)
 
 
 async def translate_to_russian(text: str) -> str:
-    """Translate text from Serbian to Russian using a free translation service."""
+    """Translate text from Serbian to Russian, via GigaChat."""
     if not text:
         return text
 
@@ -41,24 +59,26 @@ async def translate_to_russian(text: str) -> str:
             return text
 
     try:
-        # GoogleTranslator.translate() makes a blocking HTTP request —
-        # run it off the event loop so it doesn't stall the whole bot.
-        translated = await asyncio.to_thread(_translate_sync, text)
+        giga = get_gigachat_client()
+        if not giga:
+            logger.warning("GigaChat client not available, skipping translation")
+            return text
 
-        # If translation is empty or error, return original
+        chat = Chat(model="GigaChat", messages=[
+            Messages(role="system", content=_TRANSLATE_SYSTEM_PROMPT),
+            Messages(role="user", content=text),
+        ])
+        response = await giga.achat(chat)
+        translated = (response.choices[0].message.content or "").strip()
+
+        # If translation is empty or suspiciously short, return original
         if not translated or len(translated) < len(text) * 0.3:
             return text
 
-        # GoogleTranslator scrapes translate.google.com rather than
-        # calling an official API — when Google returns an error page
-        # (rate limiting, a transient 500, etc.), deep-translator doesn't
-        # always raise: it can hand back the error page's own text as if
-        # it were a successful translation ("Error 500 (Server Error)!!
-        # ...That's all we know." — verbatim Google boilerplate, seen in
-        # production). That's not short enough for the length check
-        # above to catch. A genuine translation *into Russian* should be
-        # predominantly Cyrillic; anything else is almost certainly this
-        # failure mode, not a real translation.
+        # A genuine translation *into Russian* should be predominantly
+        # Cyrillic. Defense in depth against the model wandering off
+        # (e.g. answering *about* the text instead of just translating
+        # it) rather than a specific failure mode like the old scraper's.
         translated_alpha = sum(1 for c in translated if c.isalpha())
         translated_cyrillic = sum(1 for c in translated if '\u0400' <= c <= '\u04FF')
         if translated_alpha > 0 and translated_cyrillic / translated_alpha < 0.5:
@@ -70,11 +90,8 @@ async def translate_to_russian(text: str) -> str:
 
         return translated
 
-    except TranslationError as exc:
-        logger.error("Translation error: %s", exc)
-        return text
     except Exception as exc:
-        logger.error("Unexpected translation error: %s", exc)
+        logger.error("Translation error: %s", exc)
         return text
 
 
