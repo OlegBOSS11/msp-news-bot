@@ -14,6 +14,15 @@ GIGACHAT_CREDENTIALS: str = os.environ["GIGACHAT_CREDENTIALS"]
 # Format: socks5://user:password@host:port
 TELEGRAM_PROXY_URL: str | None = os.environ.get("TELEGRAM_PROXY_URL") or None
 
+# Optional: translate Serbian news via Ollama Cloud's free tier
+# (OpenAI-compatible API, https://ollama.com/settings/keys) instead of
+# GigaChat — costs nothing while the free quota lasts. Falls back to
+# GigaChat automatically (translator.py) if this isn't set or a call
+# fails, so leaving it unset just means translation goes through
+# GigaChat as before — nothing breaks either way.
+OLLAMA_API_KEY: str | None = os.environ.get("OLLAMA_API_KEY") or None
+OLLAMA_MODEL: str = os.environ.get("OLLAMA_MODEL", "gpt-oss:20b-cloud")
+
 # --- Serbian news sources (for translation) ---
 SERBIAN_NEWS_SOURCES: list[str] = [
     "n1info.rs", "blic.rs", "telegraf.rs", "b92.net", "kurir.rs", "danas.rs", "nova.rs",

@@ -1238,6 +1238,107 @@ class TestTranslationSanity:
             result = await translate_to_russian("Nove vize za strane radnike u Srbiji")
             assert result == "Nove vize za strane radnike u Srbiji"
 
+    @pytest.mark.asyncio
+    async def test_ollama_used_first_gigachat_not_called_when_it_succeeds(self):
+        """Ollama Cloud (free) is the preferred path — GigaChat should
+        never even be touched if Ollama already produced a good result."""
+        from translator import translate_to_russian
+
+        with patch(
+            "translator._translate_via_ollama_cloud",
+            new=AsyncMock(return_value="Новые визы для иностранных работников в Сербии"),
+        ):
+            with patch("translator.get_gigachat_client") as mock_get_giga:
+                result = await translate_to_russian("Nove vize za strane radnike u Srbiji")
+                assert result == "Новые визы для иностранных работников в Сербии"
+                mock_get_giga.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_ollama_failure_falls_back_to_gigachat(self):
+        """Ollama unavailable/failed (returns None) -> GigaChat is tried
+        next, not skipped straight to the original text."""
+        from translator import translate_to_russian
+
+        with patch("translator._translate_via_ollama_cloud", new=AsyncMock(return_value=None)):
+            giga = _mock_giga_returning("Новые визы для иностранных работников в Сербии")
+            with patch("translator.get_gigachat_client", return_value=giga):
+                result = await translate_to_russian("Nove vize za strane radnike u Srbiji")
+                assert result == "Новые визы для иностранных работников в Сербии"
+
+    @pytest.mark.asyncio
+    async def test_ollama_cloud_no_api_key_returns_none_without_network_call(self):
+        from translator import _translate_via_ollama_cloud
+
+        with patch("config.OLLAMA_API_KEY", None):
+            with patch("aiohttp.ClientSession") as mock_session_cls:
+                result = await _translate_via_ollama_cloud("test")
+                assert result is None
+                mock_session_cls.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_ollama_cloud_parses_openai_style_response(self):
+        from translator import _translate_via_ollama_cloud
+
+        class _Resp:
+            status = 200
+
+            async def json(self):
+                return {"choices": [{"message": {"content": "Новые визы"}}]}
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *a):
+                return False
+
+        class _Session:
+            def post(self, *a, **kw):
+                return _Resp()
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *a):
+                return False
+
+        with patch("config.OLLAMA_API_KEY", "test-key"):
+            with patch("aiohttp.ClientSession", return_value=_Session()):
+                with patch("aiohttp.TCPConnector"):
+                    result = await _translate_via_ollama_cloud("Nove vize")
+                    assert result == "Новые визы"
+
+    @pytest.mark.asyncio
+    async def test_ollama_cloud_http_error_returns_none(self):
+        from translator import _translate_via_ollama_cloud
+
+        class _Resp:
+            status = 429
+
+            async def text(self):
+                return "rate limited"
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *a):
+                return False
+
+        class _Session:
+            def post(self, *a, **kw):
+                return _Resp()
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *a):
+                return False
+
+        with patch("config.OLLAMA_API_KEY", "test-key"):
+            with patch("aiohttp.ClientSession", return_value=_Session()):
+                with patch("aiohttp.TCPConnector"):
+                    result = await _translate_via_ollama_cloud("Nove vize")
+                    assert result is None
+
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
