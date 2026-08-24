@@ -1177,5 +1177,39 @@ class TestRealEstateFreeTextSearch:
         ) is True
 
 
+# --- Test 17: Google Translate returning its own error page as "translated" text ---
+
+class TestTranslationSanity:
+    """deep-translator's GoogleTranslator scrapes translate.google.com
+    rather than calling an official API — when Google returns an error
+    page, it doesn't always raise: it can hand back the error page's own
+    text as a "successful" translation. Seen in production: every digest
+    item's title came back as Google's literal "Error 500 (Server
+    Error)!! ...That's all we know." boilerplate."""
+
+    @pytest.mark.asyncio
+    async def test_google_error_page_is_discarded_not_used(self):
+        from translator import translate_to_russian
+
+        garbage = (
+            "Error 500 (Server Error)!!1500.That's an error."
+            "There was an error. Please try again later.That's all we know."
+        )
+        with patch("translator._translate_sync", return_value=garbage):
+            result = await translate_to_russian("Nove vize za strane radnike u Srbiji")
+            assert result == "Nove vize za strane radnike u Srbiji"
+
+    @pytest.mark.asyncio
+    async def test_real_russian_translation_still_passes_through(self):
+        from translator import translate_to_russian
+
+        with patch(
+            "translator._translate_sync",
+            return_value="Новые визы для иностранных работников в Сербии",
+        ):
+            result = await translate_to_russian("Nove vize za strane radnike u Srbiji")
+            assert result == "Новые визы для иностранных работников в Сербии"
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

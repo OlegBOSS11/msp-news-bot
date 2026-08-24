@@ -49,6 +49,25 @@ async def translate_to_russian(text: str) -> str:
         if not translated or len(translated) < len(text) * 0.3:
             return text
 
+        # GoogleTranslator scrapes translate.google.com rather than
+        # calling an official API — when Google returns an error page
+        # (rate limiting, a transient 500, etc.), deep-translator doesn't
+        # always raise: it can hand back the error page's own text as if
+        # it were a successful translation ("Error 500 (Server Error)!!
+        # ...That's all we know." — verbatim Google boilerplate, seen in
+        # production). That's not short enough for the length check
+        # above to catch. A genuine translation *into Russian* should be
+        # predominantly Cyrillic; anything else is almost certainly this
+        # failure mode, not a real translation.
+        translated_alpha = sum(1 for c in translated if c.isalpha())
+        translated_cyrillic = sum(1 for c in translated if '\u0400' <= c <= '\u04FF')
+        if translated_alpha > 0 and translated_cyrillic / translated_alpha < 0.5:
+            logger.warning(
+                "Translation result doesn't look like Russian, discarding: %r",
+                translated[:100],
+            )
+            return text
+
         return translated
 
     except TranslationError as exc:
