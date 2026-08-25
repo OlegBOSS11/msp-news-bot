@@ -1343,13 +1343,13 @@ class TestTranslationSanity:
 # --- Test 18: real-estate listing titles translated before display ---
 
 class TestRealEstateTranslation:
-    """Listing titles come from scraped Serbian sites (halooglasi.com) —
-    should be translated to Russian before showing to the user, same as
-    news titles. Location (city/neighborhood names) is deliberately left
-    untranslated — those are proper nouns, not descriptive text."""
+    """Listing titles and locations come from scraped Serbian sites
+    (halooglasi.com) — both translated to Russian before showing to the
+    user, same as news titles (per user request: fully translated is more
+    useful than leaving place names in Serbian)."""
 
     @pytest.mark.asyncio
-    async def test_menu_listing_translates_serbian_title(self):
+    async def test_menu_listing_translates_title_and_location(self):
         from bot import _send_real_estate_listing
 
         message = AsyncMock()
@@ -1360,22 +1360,26 @@ class TestRealEstateTranslation:
             "url": "https://example.com/1",
             "image_url": None,
         }
-        with patch("bot.translate_to_russian", new=AsyncMock(return_value="Квартира на продажу в Белграде")) as mock_translate:
+        translations = {
+            "Stan na prodaju u Beogradu": "Квартира на продажу в Белграде",
+            "Beograd, Vračar": "Белград, Врачар",
+        }
+        with patch("bot.translate_to_russian", new=AsyncMock(side_effect=lambda t: translations[t])) as mock_translate:
             await _send_real_estate_listing(message, row, 1)
-            mock_translate.assert_awaited_once_with("Stan na prodaju u Beogradu")
+            assert mock_translate.await_count == 2
             caption = message.answer.call_args.args[0]
             assert "Квартира на продажу в Белграде" in caption
-            assert "Vračar" in caption  # location untouched
+            assert "Белград, Врачар" in caption
 
     @pytest.mark.asyncio
-    async def test_menu_listing_skips_translation_for_russian_title(self):
+    async def test_menu_listing_skips_translation_for_russian_fields(self):
         from bot import _send_real_estate_listing
 
         message = AsyncMock()
         row = {
             "title": "Квартира в центре города",
             "price": "50000 €",
-            "location": "Novi Sad",
+            "location": "Белград, центр",
             "url": "https://example.com/2",
             "image_url": None,
         }

@@ -706,10 +706,10 @@ async def _send_real_estate_listing(message: Message, row: dict, idx: int) -> No
         raw_title = await translate_to_russian(raw_title)
     title = telegram_text(raw_title)
     price = telegram_text(row["price"]) if row["price"] else "не указана"
-    # location is city/neighborhood names (proper nouns, e.g. "Beograd,
-    # Vračar") — left untranslated on purpose, translating a place name
-    # would make it harder to recognize/search, not easier.
-    location = telegram_text(row["location"]) if row["location"] else "не указано"
+    raw_location = row["location"]
+    if raw_location and detect_language(raw_location) == "serbian":
+        raw_location = await translate_to_russian(raw_location)
+    location = telegram_text(raw_location) if raw_location else "не указано"
     link = telegram_link(row["url"], "Подробнее")
     caption = (
         f"<b>📌 {idx}. {title}</b>\n"
@@ -966,10 +966,10 @@ async def handle_question(message: Message) -> None:
                     if title and detect_language(title) == "serbian":
                         title = await translate_to_russian(title)
                     price = telegram_text(listing.price) if listing.price else "не указана"
-                    # location is city/neighborhood names (proper nouns) —
-                    # left untranslated on purpose, see the same note in
-                    # _send_real_estate_listing().
-                    location = telegram_text(listing.location) if listing.location else "не указана"
+                    raw_location = listing.location
+                    if raw_location and detect_language(raw_location) == "serbian":
+                        raw_location = await translate_to_russian(raw_location)
+                    location = telegram_text(raw_location) if raw_location else "не указана"
                     caption = (
                         f"<b>📌 {i+1}. {telegram_text(title)}</b>\n"
                         f"💰 Цена: {price}\n"
