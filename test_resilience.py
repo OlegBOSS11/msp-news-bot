@@ -1340,5 +1340,49 @@ class TestTranslationSanity:
                     assert result is None
 
 
+# --- Test 18: real-estate listing titles translated before display ---
+
+class TestRealEstateTranslation:
+    """Listing titles come from scraped Serbian sites (halooglasi.com) —
+    should be translated to Russian before showing to the user, same as
+    news titles. Location (city/neighborhood names) is deliberately left
+    untranslated — those are proper nouns, not descriptive text."""
+
+    @pytest.mark.asyncio
+    async def test_menu_listing_translates_serbian_title(self):
+        from bot import _send_real_estate_listing
+
+        message = AsyncMock()
+        row = {
+            "title": "Stan na prodaju u Beogradu",
+            "price": "100000 €",
+            "location": "Beograd, Vračar",
+            "url": "https://example.com/1",
+            "image_url": None,
+        }
+        with patch("bot.translate_to_russian", new=AsyncMock(return_value="Квартира на продажу в Белграде")) as mock_translate:
+            await _send_real_estate_listing(message, row, 1)
+            mock_translate.assert_awaited_once_with("Stan na prodaju u Beogradu")
+            caption = message.answer.call_args.args[0]
+            assert "Квартира на продажу в Белграде" in caption
+            assert "Vračar" in caption  # location untouched
+
+    @pytest.mark.asyncio
+    async def test_menu_listing_skips_translation_for_russian_title(self):
+        from bot import _send_real_estate_listing
+
+        message = AsyncMock()
+        row = {
+            "title": "Квартира в центре города",
+            "price": "50000 €",
+            "location": "Novi Sad",
+            "url": "https://example.com/2",
+            "image_url": None,
+        }
+        with patch("bot.translate_to_russian", new=AsyncMock()) as mock_translate:
+            await _send_real_estate_listing(message, row, 1)
+            mock_translate.assert_not_called()
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

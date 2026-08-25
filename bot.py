@@ -701,8 +701,14 @@ async def _send_real_estate_listing(message: Message, row: dict, idx: int) -> No
     All fields come from scraped listing pages (real_estate_listings table)
     — external input, escaped before going into an HTML message.
     """
-    title = telegram_text(row["title"])
+    raw_title = row["title"]
+    if raw_title and detect_language(raw_title) == "serbian":
+        raw_title = await translate_to_russian(raw_title)
+    title = telegram_text(raw_title)
     price = telegram_text(row["price"]) if row["price"] else "не указана"
+    # location is city/neighborhood names (proper nouns, e.g. "Beograd,
+    # Vračar") — left untranslated on purpose, translating a place name
+    # would make it harder to recognize/search, not easier.
     location = telegram_text(row["location"]) if row["location"] else "не указано"
     link = telegram_link(row["url"], "Подробнее")
     caption = (
@@ -956,10 +962,16 @@ async def handle_question(message: Message) -> None:
 
                 # Send first listing with photo if available
                 for i, listing in enumerate(listings[:5]):
+                    title = listing.title
+                    if title and detect_language(title) == "serbian":
+                        title = await translate_to_russian(title)
                     price = telegram_text(listing.price) if listing.price else "не указана"
+                    # location is city/neighborhood names (proper nouns) —
+                    # left untranslated on purpose, see the same note in
+                    # _send_real_estate_listing().
                     location = telegram_text(listing.location) if listing.location else "не указана"
                     caption = (
-                        f"<b>📌 {i+1}. {telegram_text(listing.title)}</b>\n"
+                        f"<b>📌 {i+1}. {telegram_text(title)}</b>\n"
                         f"💰 Цена: {price}\n"
                         f"📍 Локация: {location}\n"
                         f"🌐 Источник: {telegram_text(listing.source)}\n"
