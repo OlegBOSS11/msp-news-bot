@@ -87,7 +87,7 @@ SYSTEM_PROMPT_TEMPLATE = """Ты — эксперт по релокации из
 
 Ты работаешь в Telegram-боте, который помогает людям, рассматривающим переезд из России в Сербию. Вот что бот умеет:
 - /digest — получить сводку актуальных новостей о Сербии и релокации за сегодня
-- Автоматическая ежедневная рассылка новостей в 10:00 и 18:00 МСК
+- Автоматическая ежедневная рассылка новостей в 20:00 МСК
 - Ответы на вопросы о жизни в Сербии, переезде, визах, работе, недвижимости
 
 Отвечай на вопросы пользователей о:
@@ -411,7 +411,7 @@ async def send_daily_digest() -> None:
     personalized per user by their enabled news topics and by what they've
     already been sent (database.user_sent_news).
 
-    Called only by the 10:00/18:00 scheduler jobs.
+    Called only by the 20:00 scheduler job.
     """
     logger.info("Starting daily digest collection...")
     fresh = await _collect_fresh_news()
@@ -477,7 +477,7 @@ WELCOME_TEXT = (
     "❓ <b>Помощь</b> — справка по всем функциям\n"
     "🏠 <b>Недвижимость</b> — подбор объявлений по городу, типу сделки и сортировке\n\n"
     "💬 Просто напишите текст — и я отвечу с помощью ИИ!\n\n"
-    "🕐 Сводка приходит автоматически в <b>10:00</b> и <b>18:00</b> МСК\n\n"
+    "🕐 Сводка приходит автоматически в <b>20:00</b> МСК\n\n"
     "⚠️ Использую только свежую информацию"
 )
 
@@ -550,7 +550,7 @@ async def cmd_status(message: Message) -> None:
         f"📰 Всего новостей в базе: {stats['total']}\n"
         f"📅 За сегодня: {stats['today']}\n"
         f"⏰ Последняя отправка: {stats['last_sent'] or 'нет'}\n"
-        f"🔔 Следующая сводка: в 18:00 МСК",
+        f"🔔 Следующая сводка: в 20:00 МСК",
         parse_mode="HTML",
         reply_markup=back_button_kb(),
     )
@@ -643,7 +643,7 @@ async def cb_status(callback: CallbackQuery) -> None:
         f"📰 Всего новостей в базе: {stats['total']}\n"
         f"📅 За сегодня: {stats['today']}\n"
         f"⏰ Последняя отправка: {stats['last_sent'] or 'нет'}\n"
-        f"🔔 Следующая сводка: в 18:00 МСК",
+        f"🔔 Следующая сводка: в 20:00 МСК",
         parse_mode="HTML",
         reply_markup=back_button_kb(),
     )
@@ -1203,14 +1203,8 @@ async def main() -> None:
     scheduler = AsyncIOScheduler(timezone=config.TIMEZONE)
     scheduler.add_job(
         send_daily_digest,
-        trigger=CronTrigger(hour=10, minute=0, timezone=config.TIMEZONE),
+        trigger=CronTrigger(hour=20, minute=0, timezone=config.TIMEZONE),
         id="daily_digest",
-        replace_existing=True,
-    )
-    scheduler.add_job(
-        send_daily_digest,
-        trigger=CronTrigger(hour=18, minute=0, timezone=config.TIMEZONE),
-        id="evening_digest",
         replace_existing=True,
     )
     scheduler.add_job(
@@ -1236,7 +1230,7 @@ async def main() -> None:
         id="initial_digest",
     )
     scheduler.start()
-    logger.info("Scheduler started — next runs at 10:00 and 18:00 MSK.")
+    logger.info("Scheduler started — next run at 20:00 MSK.")
 
     logger.info("Starting bot polling...")
     await dp.start_polling(bot)

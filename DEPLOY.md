@@ -116,7 +116,7 @@ python bot.py
 Ожидаемые строки в логе:
 ```
 Database initialized.
-Scheduler started — next runs at 10:00 and 18:00 MSK.
+Scheduler started — next run at 20:00 MSK.
 Sending initial digest now...
 Starting bot polling...
 ```
