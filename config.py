@@ -238,8 +238,11 @@ COUNTRIES: dict[str, dict] = {
     "turkey": {
         "name": "Турция",
         "flag": "🇹🇷",
-        "local_domains": set(),
-        "local_feeds": [],
+        # Verified reachable + valid RSS Nov 2026 (see probe_sources.sh run).
+        "local_domains": {"trtrussian.com"},
+        "local_feeds": [
+            {"name": "trtrussian.com", "url": "https://www.trtrussian.com/feed/rss.xml"},
+        ],
         "local_keywords": {
             "country": ["турция", "турецк", "стамбул", "анталья", "turkiye", "istanbul"],
             "work": [],

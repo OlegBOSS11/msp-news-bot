@@ -1410,5 +1410,83 @@ class TestRealEstateTranslation:
             assert "Белград, центр" in caption
 
 
+# --- Test 13: New-country real estate parsers, against captured live HTML ---
+
+class TestNewCountryRealEstateParsers:
+    """Regression fixtures captured from a live fetch (Nov 2026) of each
+    site — not synthetic guesses, so a selector change on the live site
+    breaking these is a true positive worth investigating, not noise."""
+
+    def test_parse_myhome_ge(self):
+        """myhome.ge's listing grid is client-rendered (Next.js) — the
+        parser reads the server-embedded __NEXT_DATA__ JSON (React Query's
+        dehydrated cache) instead of scraping DOM nodes."""
+        import json
+        from real_estate import parse_myhome_ge
+
+        item = {
+            "id": 26556597, "deal_type_id": 2, "real_estate_type_id": 1,
+            "price": {"1": {"price_total": 1687, "price_square": 28},
+                      "2": {"price_total": 650, "price_square": 11},
+                      "3": {"price_total": 578, "price_square": 10}},
+            "images": [{"large": "https://static-api-statements.tnet.ge/uploads/x.webp"}],
+            "dynamic_title": "3 room apartment for rent in saburtalo",
+            "href_lang": {"ka": "qiravdeba-3-otaxiani-bina-saburtaloze",
+                          "en": "3-room-apartment-for-rent-in-saburtalo",
+                          "ru": "sdaetsia-3-komnatnaia-kvartira-v-saburtalo"},
+            "urban_name": "Saburtalo", "city_name": "Tbilisi",
+        }
+        next_data = {"props": {"pageProps": {"dehydratedState": {"queries": [
+            {"state": {"data": "1"}},  # an unrelated earlier query in the cache
+            {"state": {"data": {"data": {"data": [item]}}}},
+        ]}}}}
+        html = f'<html><script id="__NEXT_DATA__">{json.dumps(next_data)}</script></html>'
+
+        results = parse_myhome_ge(html, city="tbilisi", deal_type="rent")
+        assert len(results) == 1
+        r = results[0]
+        assert r.ad_id == "myhome-26556597"
+        assert r.url == "https://www.myhome.ge/en/pr/26556597/3-room-apartment-for-rent-in-saburtalo/"
+        assert r.price == "1687 GEL"
+        assert r.price_value == 1687
+        assert r.location == "Saburtalo, Tbilisi"
+        assert r.city == "tbilisi"
+        assert r.deal_type == "rent"
+        assert r.image_url == "https://static-api-statements.tnet.ge/uploads/x.webp"
+
+    def test_parse_nekretnina_me(self):
+        """nekretnina.me: a real <article class="card"> block, captured
+        from the real-estate-sales category page."""
+        from real_estate import parse_nekretnina_me
+
+        card_html = '''
+        <article class="card group rounded-md aspect-4/3">
+        <img alt="Stone palace" src="/_next/image/?url=https%3A%2F%2Fexample.com%2Fx.jpg&amp;w=1400&amp;q=90"/>
+        <span class="card-veil" data-nosnippet="true">
+          <span class="card-scrim" aria-hidden="true"></span>
+          <span class="absolute inset-x-0 bottom-0 block text-paper p-5 sm:p-6">
+            <span class="card-headline block text-[1.1875rem]">Stone palace for renovation on the first line to the sea</span>
+            <span class="t-ui mt-2 flex flex-wrap items-center gap-x-4 gap-y-1 text-[0.8125rem] text-paper/80">
+              <span class="flex items-center gap-1.5"><svg></svg> Prčanj, Kotor</span>
+              <span class="flex items-center gap-1.5 whitespace-nowrap"><svg></svg> 4</span>
+            </span>
+            <span class="card-price mt-3 block text-[1.3125rem]">On request</span>
+          </span>
+        </span>
+        <span class="t-nav absolute left-4 top-4 rounded-sm px-3 py-1.5 text-[0.625rem] bg-sand-deep text-paper">Villa</span>
+        <a class="absolute inset-0 z-[1] rounded-md" href="/en/real-estate/stone-palace-for-renovation-on-the-first-line-to-the-sea-prcanj/"></a>
+        </article>
+        '''
+        results = parse_nekretnina_me(card_html, "https://nekretnina.me")
+        assert len(results) == 1
+        r = results[0]
+        assert r.ad_id == "nekretnina-stone-palace-for-renovation-on-the-first-line-to-the-sea-prcanj"
+        assert r.title == "Stone palace for renovation on the first line to the sea"
+        assert r.url == "https://nekretnina.me/en/real-estate/stone-palace-for-renovation-on-the-first-line-to-the-sea-prcanj/"
+        assert r.price == "On request"
+        assert r.location == "Prčanj, Kotor"
+        assert r.image_url == "https://nekretnina.me/_next/image/?url=https%3A%2F%2Fexample.com%2Fx.jpg&w=1400&q=90"
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

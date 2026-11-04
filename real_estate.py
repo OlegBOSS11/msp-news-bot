@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import re
 import socket
@@ -818,6 +819,186 @@ async def search_real_estate_with_fallback(
     return listings[:15], is_predefined
 
 
+def _myhome_ge_extract_items(next_data: dict) -> list[dict]:
+    """Walk __NEXT_DATA__'s dehydrated react-query cache for the listing
+    array — queries[i].state.data.data.data, confirmed against a live
+    fetch Nov 2026. Query ordering/keys aren't documented, so this searches
+    by shape (first query whose data.data.data is a non-empty list) rather
+    than a hardcoded index/key, which would break silently if the site
+    adds another query ahead of it in the cache."""
+    try:
+        queries = next_data["props"]["pageProps"]["dehydratedState"]["queries"]
+    except (KeyError, TypeError):
+        return []
+    for q in queries:
+        try:
+            items = q["state"]["data"]["data"]["data"]
+        except (KeyError, TypeError):
+            continue
+        if isinstance(items, list) and items:
+            return items
+    return []
+
+
+def parse_myhome_ge(html: str, city: str, deal_type: str) -> list[PropertyListing]:
+    """Parse myhome.ge's listing grid.
+
+    Unlike every other parser in this file, this isn't a BeautifulSoup/CSS-
+    selector scrape — the listing grid itself is client-rendered (Next.js),
+    but the server response embeds the full listing data as JSON in a
+    <script id="__NEXT_DATA__"> tag (React Query's dehydrated cache), which
+    is both more reliable and simpler to parse than the DOM would be.
+    Confirmed against a live fetch (Tbilisi/Saburtalo rent) Nov 2026.
+    """
+    listings = []
+    try:
+        match = re.search(r'<script id="__NEXT_DATA__"[^>]*>(.*?)</script>', html, re.S)
+        if not match:
+            return []
+        next_data = json.loads(match.group(1))
+        items = _myhome_ge_extract_items(next_data)
+        for item in items:
+            raw_id = item.get("id")
+            title = item.get("dynamic_title") or ""
+            href_en = (item.get("href_lang") or {}).get("en")
+            if raw_id is None or not title or not href_en:
+                continue
+            # Prefixed — ad_id is a global PRIMARY KEY across every
+            # country's listings in one table, and myhome.ge's own
+            # numeric ids could in principle collide with another site's.
+            ad_id = f"myhome-{raw_id}"
+            url = f"https://www.myhome.ge/en/pr/{raw_id}/{href_en}/"
+
+            # price is keyed "1"/"2"/"3" for GEL/USD/EUR respectively
+            # (derived from the ratios between them, not documented by the
+            # site) — GEL (the local currency) is the most meaningful one
+            # to show and sort by.
+            price_gel = (item.get("price") or {}).get("1") or {}
+            price_total = price_gel.get("price_total")
+            price = f"{price_total} GEL" if price_total is not None else None
+
+            location_parts = [item.get("urban_name"), item.get("city_name")]
+            location = ", ".join(p for p in location_parts if p) or None
+
+            images = item.get("images") or []
+            image_url = images[0].get("large") if images else None
+
+            listings.append(PropertyListing(
+                ad_id=ad_id,
+                title=title,
+                url=url,
+                price=price,
+                location=location,
+                source="MyHome.ge",
+                image_url=image_url,
+                city=city,
+                deal_type=deal_type,
+                price_value=price_total,
+            ))
+    except Exception as exc:
+        logger.error("Error parsing myhome.ge: %s", exc)
+    return listings
+
+
+MYHOME_GE_CITIES = ["tbilisi"]
+MYHOME_GE_DEALS = [("rent", "rent"), ("sale", "sale")]
+MYHOME_GE_COLLECTOR_URLS = [
+    (f"https://www.myhome.ge/en/real-estate/{slug}/apartment/{city}/", city, deal_type)
+    for city in MYHOME_GE_CITIES
+    for slug, deal_type in MYHOME_GE_DEALS
+]
+
+
+async def collect_myhome_ge_listings() -> list[PropertyListing]:
+    """Fetch a few myhome.ge listing pages for the background collector —
+    same "small number of pages, delay between requests" convention as
+    collect_halooglasi_listings() above."""
+    all_listings: list[PropertyListing] = []
+    for url, city, deal_type in MYHOME_GE_COLLECTOR_URLS:
+        html = await asyncio.to_thread(_fetch_page_sync, url, 15)
+        if html:
+            all_listings.extend(parse_myhome_ge(html, city=city, deal_type=deal_type))
+        await asyncio.sleep(3)
+    return all_listings
+
+
+def parse_nekretnina_me(html: str, base_url: str) -> list[PropertyListing]:
+    """Parse nekretnina.me's listing grid.
+
+    Confirmed against a live fetch (real-estate-sales category) Nov 2026 —
+    each card is an <article class="card ..."> with semantic sub-classes
+    (not just Tailwind utility noise): .card-headline (title), .card-price,
+    and a location string right after a pin icon. The card's click target
+    is a separate overlay <a class="absolute inset-0 ..." href="...">
+    layered on top, not the <article> itself.
+    """
+    listings = []
+    try:
+        soup = BeautifulSoup(html, "html.parser")
+        cards = soup.select("article.card")
+        for card in cards:
+            title_el = card.select_one(".card-headline")
+            link_el = card.find("a", href=True)
+            if not title_el or not link_el:
+                continue
+
+            title = title_el.get_text(strip=True)
+            href = link_el["href"]
+            link = href if href.startswith("http") else urljoin(base_url, href)
+            # The listing's own URL slug as the stable id — prefixed so it
+            # can never collide with another country's ad_id in the shared
+            # real_estate_listings table (ad_id is a global PRIMARY KEY).
+            slug = href.strip("/").rsplit("/", 1)[-1]
+            ad_id = f"nekretnina-{slug}" if slug else ""
+
+            price_el = card.select_one(".card-price")
+            price = price_el.get_text(strip=True) if price_el else None
+
+            # Location text is the first "gap-1.5"-class span after the
+            # title (room count/floor/area spans further along share the
+            # same utility classes, so this only works because it's first
+            # in document order — confirmed against the live sample).
+            loc_el = card.find("span", class_=lambda c: c and "gap-1.5" in c.split())
+            location = loc_el.get_text(strip=True) if loc_el else None
+
+            img_el = card.find("img")
+            image_url = None
+            if img_el and img_el.get("src"):
+                image_url = urljoin(base_url, img_el["src"])
+
+            listings.append(PropertyListing(
+                ad_id=ad_id,
+                title=title,
+                url=link,
+                price=price,
+                location=location,
+                source="Nekretnina.me",
+                image_url=image_url,
+            ))
+    except Exception as exc:
+        logger.error("Error parsing nekretnina.me: %s", exc)
+    return listings
+
+
+NEKRETNINA_ME_COLLECTOR_URLS = [
+    "https://nekretnina.me/en/real-estate-sales/",
+]
+
+
+async def collect_nekretnina_me_listings() -> list[PropertyListing]:
+    """Fetch nekretnina.me's listings category page(s) for the background
+    collector. Only the sales category is confirmed reachable so far — a
+    rentals category almost certainly exists too but its URL hasn't been
+    verified live yet, so it's deliberately not guessed at here."""
+    all_listings: list[PropertyListing] = []
+    for url in NEKRETNINA_ME_COLLECTOR_URLS:
+        html = await asyncio.to_thread(_fetch_page_sync, url, 15)
+        if html:
+            all_listings.extend(parse_nekretnina_me(html, "https://nekretnina.me"))
+        await asyncio.sleep(3)
+    return all_listings
+
+
 # --- Per-country real estate registry ---
 # Adding a country's real estate support means adding one entry here (plus
 # a parser like parse_halooglasi() + a collector like
@@ -843,9 +1024,9 @@ COUNTRY_REAL_ESTATE: dict[str, dict] = {
         "fallback_listings": PREDEFINED_LISTINGS,
     },
     "georgia": {
-        "cities": [],
-        "city_aliases": {},
-        "collector": None,  # pending — see TaskList: myhome.ge needs live verification
+        "cities": MYHOME_GE_CITIES,
+        "city_aliases": {"тбилиси": "tbilisi", "tbilisi": "tbilisi"},
+        "collector": collect_myhome_ge_listings,
         "fallback_listings": [
             PropertyListing(
                 title="🔍 Недвижимость в Грузии на MyHome.ge",
@@ -885,11 +1066,11 @@ COUNTRY_REAL_ESTATE: dict[str, dict] = {
         ],
     },
     "montenegro": {
-        "cities": [],
+        "cities": [],  # nekretnina.me isn't scraped per-city yet, just one category page
         "city_aliases": {},
         # Domain corrected after live verification: nekretnina.me
         # (singular), not nekretnine.me — the latter doesn't resolve.
-        "collector": None,  # pending — see TaskList (nekretnina.me looks scrapable, needs a parser)
+        "collector": collect_nekretnina_me_listings,
         "fallback_listings": [
             PropertyListing(
                 title="🔍 Недвижимость в Черногории на Nekretnina.me",
