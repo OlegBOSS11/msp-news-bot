@@ -585,6 +585,51 @@ def get_welcome_text(country: str) -> str:
     )
 
 
+HELP_TEXT_SERBIA = (
+    "🤖 <b>Что я умею:</b>\n\n"
+    "📋 /digest — получить сводку новостей о Сербии\n"
+    "📰 /news — последние новости из базы\n"
+    "📊 /status — статус бота и статистика\n"
+    "🗑️ /clear — очистить историю диалога\n"
+    "🏠 Недвижимость — подбор объявлений по городу и фильтрам (кнопка в меню)\n"
+    "💬 Задать вопрос — отвечу о релокации в Сербию\n\n"
+    "<b>Примеры вопросов:</b>\n"
+    "• Как получить ВНЖ в Сербии?\n"
+    "• Какие школы есть в Белграде?\n"
+    "• Сколько стоит аренда квартиры?\n"
+    "• Как открыть банковский счёт?\n"
+    "• Какие налоги в Сербии?\n"
+    "• Какие документы нужны для переезда?\n"
+    "• Есть ли работа для русских?\n"
+    "• Какая медицина в Сербии?"
+)
+
+
+def get_help_text(country: str) -> str:
+    """/help text for `country` — see get_welcome_text()'s docstring for
+    why Serbia keeps its hand-written text and others get a generic one."""
+    if country == "serbia":
+        return HELP_TEXT_SERBIA
+    info = config.COUNTRIES.get(country, config.COUNTRIES[config.DEFAULT_COUNTRY])
+    return (
+        "🤖 <b>Что я умею:</b>\n\n"
+        f"📋 /digest — получить сводку новостей ({info['flag']} {info['name']})\n"
+        "📰 /news — последние новости из базы\n"
+        "📊 /status — статус бота и статистика\n"
+        "🗑️ /clear — очистить историю диалога\n"
+        "🏠 Недвижимость — подбор объявлений (кнопка в меню)\n"
+        "💬 Задать вопрос — отвечу о релокации\n\n"
+        "<b>Примеры вопросов:</b>\n"
+        "• Как получить ВНЖ?\n"
+        "• Сколько стоит аренда квартиры?\n"
+        "• Как открыть банковский счёт?\n"
+        "• Какие налоги?\n"
+        "• Какие документы нужны для переезда?\n"
+        "• Есть ли работа для русских?\n"
+        "• Какая там медицина?"
+    )
+
+
 # --- Command handlers (slash commands still work) ---
 
 @dp.message(CommandStart())
@@ -636,23 +681,9 @@ async def cb_country_select(callback: CallbackQuery) -> None:
 
 @dp.message(Command("help"))
 async def cmd_help(message: Message) -> None:
+    country = await database.get_user_country(message.from_user.id) or config.DEFAULT_COUNTRY
     await message.answer(
-        "🤖 <b>Что я умею:</b>\n\n"
-        "📋 /digest — получить сводку новостей о Сербии\n"
-        "📰 /news — последние новости из базы\n"
-        "📊 /status — статус бота и статистика\n"
-        "🗑️ /clear — очистить историю диалога\n"
-        "🏠 Недвижимость — подбор объявлений по городу и фильтрам (кнопка в меню)\n"
-        "💬 Задать вопрос — отвечу о релокации в Сербию\n\n"
-        "<b>Примеры вопросов:</b>\n"
-        "• Как получить ВНЖ в Сербии?\n"
-        "• Какие школы есть в Белграде?\n"
-        "• Сколько стоит аренда квартиры?\n"
-        "• Как открыть банковский счёт?\n"
-        "• Какие налоги в Сербии?\n"
-        "• Какие документы нужны для переезда?\n"
-        "• Есть ли работа для русских?\n"
-        "• Какая медицина в Сербии?",
+        get_help_text(country),
         parse_mode="HTML",
         reply_markup=main_menu_kb(),
     )
@@ -733,22 +764,9 @@ async def cb_start(callback: CallbackQuery) -> None:
 
 @dp.callback_query(F.data == "cmd_help")
 async def cb_help(callback: CallbackQuery) -> None:
+    country = await database.get_user_country(callback.from_user.id) or config.DEFAULT_COUNTRY
     await callback.message.edit_text(
-        "🤖 <b>Что я умею:</b>\n\n"
-        "📋 <b>Сводка</b> — ежедневная подборка новостей о Сербии\n"
-        "📰 <b>Новости</b> — последние новости из базы\n"
-        "📊 <b>Статус</b> — статус бота и статистика\n"
-        "🏠 <b>Недвижимость</b> — подбор объявлений по городу и фильтрам\n"
-        "💬 <b>Вопрос</b> — просто напишите текст и получите ответ от ИИ\n\n"
-        "<b>Примеры вопросов:</b>\n"
-        "• Как получить ВНЖ в Сербии?\n"
-        "• Какие школы есть в Белграде?\n"
-        "• Сколько стоит аренда квартиры?\n"
-        "• Как открыть банковский счёт?\n"
-        "• Какие налоги в Сербии?\n"
-        "• Какие документы нужны для переезда?\n"
-        "• Есть ли работа для русских?\n"
-        "• Какая медицина в Сербии?",
+        get_help_text(country),
         parse_mode="HTML",
         reply_markup=back_button_kb(),
     )
