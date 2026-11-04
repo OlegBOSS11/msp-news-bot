@@ -214,10 +214,19 @@ COUNTRIES: dict[str, dict] = {
     "georgia": {
         "name": "Грузия",
         "flag": "🇬🇪",
-        "local_domains": set(),  # filled in once sources are verified — see TaskList
-        "local_feeds": [],
+        # Verified reachable + valid RSS Nov 2026 (see probe_sources.sh run).
+        "local_domains": {"civil.ge", "jam-news.net", "oc-media.org"},
+        "local_feeds": [
+            {"name": "civil.ge", "url": "https://civil.ge/feed"},
+            {"name": "jam-news.net", "url": "https://jam-news.net/ru/feed/"},
+            {"name": "oc-media.org", "url": "https://oc-media.org/feed/"},
+        ],
         "local_keywords": {
-            "country": ["грузия", "грузинск", "тбилиси", "sakartvelo", "tbilisi"],
+            # English terms included too — civil.ge/oc-media.org publish in
+            # English, and _score() runs on raw (untranslated) feed text,
+            # so an English-only article needs an English keyword to even
+            # register a score > 0 and survive the relevance filter.
+            "country": ["грузия", "грузинск", "тбилиси", "sakartvelo", "tbilisi", "georgia", "georgian"],
             "work": [],
             "realestate": [],
             "education": [],
@@ -244,8 +253,11 @@ COUNTRIES: dict[str, dict] = {
     "armenia": {
         "name": "Армения",
         "flag": "🇦🇲",
-        "local_domains": set(),
-        "local_feeds": [],
+        # Verified reachable + valid RSS Nov 2026 (see probe_sources.sh run).
+        "local_domains": {"news.am"},
+        "local_feeds": [
+            {"name": "news.am", "url": "https://news.am/rus/rss/"},
+        ],
         "local_keywords": {
             "country": ["армения", "армянск", "ереван", "hayastan", "yerevan"],
             "work": [],
@@ -259,8 +271,11 @@ COUNTRIES: dict[str, dict] = {
     "montenegro": {
         "name": "Черногория",
         "flag": "🇲🇪",
-        "local_domains": set(),
-        "local_feeds": [],
+        # Verified reachable + valid RSS Nov 2026 (see probe_sources.sh run).
+        "local_domains": {"mntimes.me"},
+        "local_feeds": [
+            {"name": "mntimes.me", "url": "https://mntimes.me/feed/"},
+        ],
         "local_keywords": {
             "country": ["черногория", "черногорск", "подгориц", "будв", "crna gora", "podgorica"],
             "work": [],
