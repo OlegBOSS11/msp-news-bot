@@ -887,14 +887,30 @@ COUNTRY_REAL_ESTATE: dict[str, dict] = {
     "montenegro": {
         "cities": [],
         "city_aliases": {},
-        "collector": None,  # pending — see TaskList
+        # Domain corrected after live verification: nekretnina.me
+        # (singular), not nekretnine.me — the latter doesn't resolve.
+        "collector": None,  # pending — see TaskList (nekretnina.me looks scrapable, needs a parser)
         "fallback_listings": [
             PropertyListing(
-                title="🔍 Недвижимость в Черногории на Nekretnine.me",
-                url="https://www.nekretnine.me",
+                title="🔍 Недвижимость в Черногории на Nekretnina.me",
+                url="https://nekretnina.me/en/real-estate-sales/",
                 price="",
                 location="Подгорица, Будва и другие города",
-                source="Nekretnine.me",
+                source="Nekretnina.me",
+            ),
+        ],
+    },
+    "crimea": {
+        "cities": [],
+        "city_aliases": {},
+        "collector": None,  # no scraper — Avito/Cian are JS-heavy and already known not scrapable (see the existing Serbia Avito entry)
+        "fallback_listings": [
+            PropertyListing(
+                title="🔍 Недвижимость в Крыму на Авито",
+                url="https://www.avito.ru/krym/nedvizhimost",
+                price="",
+                location="Симферополь, Севастополь и другие города",
+                source="Avito",
             ),
         ],
     },

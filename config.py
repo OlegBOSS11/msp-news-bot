@@ -286,4 +286,27 @@ COUNTRIES: dict[str, dict] = {
         },
         "required_terms": ["черногор", "подгориц", "будв", "котор", "релокац", "переезд", "внж", "пмж"],
     },
+    # Not a foreign country like the five above — a Russian region, so no
+    # visa/ВНЖ/гражданство angle applies (those shared "country"-category
+    # keywords just never match here, which is harmless). Flag deliberately
+    # a neutral pin, not a national flag of any kind, given Crimea's
+    # contested status — the bot doesn't take a position on it either way.
+    "crimea": {
+        "name": "Крым",
+        "flag": "📍",
+        "local_domains": {"crimea.ria.ru", "c-inform.info"},
+        "local_feeds": [
+            {"name": "crimea.ria.ru", "url": "https://crimea.ria.ru/export/rss2/archive/index.xml"},
+            {"name": "c-inform.info", "url": "https://c-inform.info/rss"},
+        ],
+        "local_keywords": {
+            "country": ["крым", "крымск", "севастопол", "симферопол"],
+            "work": [],
+            "realestate": [],
+            "education": [],
+            "finance": [],
+            "documents": [],
+        },
+        "required_terms": ["крым", "севастопол", "симферопол", "переезд"],
+    },
 }
