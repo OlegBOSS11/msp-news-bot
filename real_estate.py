@@ -78,10 +78,10 @@ _BUY_QUERY_RE = re.compile(r'купить|покупк(?:а|и|у|е|ой)?|пр
 _RENT_QUERY_RE = re.compile(r'аренд(?:а|ы|у|е|ой)?|снять|iznajmljiv(?:anje|ati)?|rent')
 
 
-def _detect_query_city(query_lower: str) -> str | None:
+def _detect_query_city(query_lower: str, city_aliases: dict[str, str]) -> str | None:
     """Best-effort city slug from a free-text query, or None if none of
     the known cities/aliases are mentioned."""
-    for alias, slug in QUERY_CITY_ALIASES.items():
+    for alias, slug in city_aliases.items():
         if alias in query_lower:
             return slug
     return None
@@ -453,18 +453,24 @@ async def collect_halooglasi_listings() -> list[PropertyListing]:
     return all_listings
 
 
-async def refresh_real_estate_database() -> int:
-    """Scrape halooglasi.com and upsert the results into the local DB.
+async def refresh_real_estate_database(country: str = "serbia") -> int:
+    """Scrape that country's real-estate source and upsert into the local DB.
 
     Called by the scheduler in bot.py every few hours (and once at
-    startup) so search_real_estate_with_fallback() can serve fresh-ish
-    listings straight from SQLite instead of scraping on every user
-    request. Returns the number of listings collected (0 on failure).
+    startup), once per supported country, so search_real_estate_with_fallback()
+    can serve fresh-ish listings straight from SQLite instead of scraping on
+    every user request. Returns the number of listings collected (0 on
+    failure, or if this country has no collector wired up yet).
     """
+    country_cfg = COUNTRY_REAL_ESTATE.get(country)
+    collector = country_cfg["collector"] if country_cfg else None
+    if collector is None:
+        return 0
+
     try:
-        listings = await collect_halooglasi_listings()
+        listings = await collector()
     except Exception as exc:
-        logger.error("Real estate collector failed: %s", exc, exc_info=True)
+        logger.error("Real estate collector failed for %s: %s", country, exc, exc_info=True)
         return 0
 
     for listing in listings:
@@ -481,11 +487,12 @@ async def refresh_real_estate_database() -> int:
             city=listing.city,
             deal_type=listing.deal_type,
             price_value=listing.price_value,
+            country=country,
         )
 
     await database.prune_stale_listings(days=7)
 
-    logger.info("Real estate collector: upserted %d listings.", len(listings))
+    logger.info("Real estate collector (%s): upserted %d listings.", country, len(listings))
     return len(listings)
 
 
@@ -679,15 +686,19 @@ PREDEFINED_LISTINGS = [
 ]
 
 
-async def search_real_estate_with_fallback(query: str = "") -> tuple[list[PropertyListing], bool]:
+async def search_real_estate_with_fallback(
+    query: str = "", country: str = "serbia"
+) -> tuple[list[PropertyListing], bool]:
     """Search for real estate listings, preferring the locally collected DB.
 
     Priority order:
         1. The real_estate_listings DB table, populated on a schedule by
            refresh_real_estate_database() — fast, no live request needed.
         2. A live scrape (search_real_estate()), if the DB is empty (e.g.
-           the collector hasn't run yet).
-        3. The static PREDEFINED_LISTINGS, if even the live scrape failed.
+           the collector hasn't run yet) — Serbia only for now, see
+           COUNTRY_REAL_ESTATE.
+        3. The static PREDEFINED_LISTINGS, if even the live scrape failed
+           (or this country has no collector wired up yet at all).
 
     Returns:
         A tuple of (listings, is_predefined). `is_predefined` is True only
@@ -695,7 +706,8 @@ async def search_real_estate_with_fallback(query: str = "") -> tuple[list[Proper
         prices/links are not guaranteed to be current. DB-backed (step 1)
         and freshly-scraped (step 2) listings are both real data.
     """
-    db_rows = await database.get_real_estate_listings(limit=100)
+    city_aliases = COUNTRY_REAL_ESTATE.get(country, {}).get("city_aliases", {})
+    db_rows = await database.get_real_estate_listings(limit=100, country=country)
     if db_rows:
         db_listings = [
             PropertyListing(
@@ -717,7 +729,7 @@ async def search_real_estate_with_fallback(query: str = "") -> tuple[list[Proper
             # basically never hits real listing text ("покажи дом в
             # нови-саде" doesn't literally appear anywhere) — extract the
             # actual signals (city/type/deal) instead and AND them.
-            city = _detect_query_city(query_lower)
+            city = _detect_query_city(query_lower, city_aliases)
             is_house = bool(_HOUSE_RE.search(query_lower))
             is_apartment = bool(_APARTMENT_RE.search(query_lower))
             is_buy = bool(_BUY_QUERY_RE.search(query_lower))
@@ -762,14 +774,19 @@ async def search_real_estate_with_fallback(query: str = "") -> tuple[list[Proper
                     db_listings = substring_matched
         return db_listings[:15], False
 
-    # DB not populated yet (e.g. collector hasn't run) — try a live scrape.
-    listings = await search_real_estate(query)
+    # DB not populated yet (e.g. collector hasn't run). Serbia additionally
+    # gets a live-scrape attempt here (its collector/search path predates
+    # the multi-country DB-first design); other countries go straight to
+    # their fallback listings — db_rows being empty for them is either
+    # "collector hasn't run yet" or "no collector wired up for this
+    # country at all", and a live scrape isn't defined for them anyway.
+    listings = await search_real_estate(query) if country == "serbia" else []
     is_predefined = False
 
     # If no listings found, use predefined links with filtering
     if not listings:
-        logger.info("Using predefined real estate listings as fallback")
-        listings = PREDEFINED_LISTINGS
+        logger.info("Using predefined real estate listings as fallback (%s)", country)
+        listings = COUNTRY_REAL_ESTATE.get(country, {}).get("fallback_listings", [])
         is_predefined = True
 
         # Filter predefined listings based on query keywords. AND-combines
@@ -799,3 +816,86 @@ async def search_real_estate_with_fallback(query: str = "") -> tuple[list[Proper
                 listings = filtered
 
     return listings[:15], is_predefined
+
+
+# --- Per-country real estate registry ---
+# Adding a country's real estate support means adding one entry here (plus
+# a parser like parse_halooglasi() + a collector like
+# collect_halooglasi_listings() above, once that country's source site is
+# confirmed scrapable via plain HTTP GET + BeautifulSoup — see DEPLOY.md /
+# the project's task list for sites still pending verification).
+#
+# `collector`: async () -> list[PropertyListing], called by the scheduled
+#   refresh_real_estate_database(country) job — or None if this country has
+#   no working scraper yet, in which case only `fallback_listings` is ever
+#   shown (same pattern this project already uses for Avito: a direct link
+#   out, not a broken scrape).
+# `fallback_listings`: shown when the DB has nothing for this country yet
+#   (collector hasn't run, or there isn't one). For countries without a
+#   collector this is a single curated direct link to a known listings
+#   site, not scraped data — search_real_estate_with_fallback() always
+#   returns is_predefined=True for these so bot.py can tell the user.
+COUNTRY_REAL_ESTATE: dict[str, dict] = {
+    "serbia": {
+        "cities": HALOOGLASI_CITIES,
+        "city_aliases": QUERY_CITY_ALIASES,
+        "collector": collect_halooglasi_listings,
+        "fallback_listings": PREDEFINED_LISTINGS,
+    },
+    "georgia": {
+        "cities": [],
+        "city_aliases": {},
+        "collector": None,  # pending — see TaskList: myhome.ge needs live verification
+        "fallback_listings": [
+            PropertyListing(
+                title="🔍 Недвижимость в Грузии на MyHome.ge",
+                url="https://www.myhome.ge/en/real-estate/rent/apartment/tbilisi/",
+                price="",
+                location="Тбилиси и другие города",
+                source="MyHome.ge",
+            ),
+        ],
+    },
+    "turkey": {
+        "cities": [],
+        "city_aliases": {},
+        "collector": None,  # pending — see TaskList
+        "fallback_listings": [
+            PropertyListing(
+                title="🔍 Недвижимость в Турции на Sahibinden.com",
+                url="https://www.sahibinden.com/satilik-daire/istanbul",
+                price="",
+                location="Стамбул и другие города",
+                source="Sahibinden.com",
+            ),
+        ],
+    },
+    "armenia": {
+        "cities": [],
+        "city_aliases": {},
+        "collector": None,  # pending — see TaskList
+        "fallback_listings": [
+            PropertyListing(
+                title="🔍 Недвижимость в Армении на List.am",
+                url="https://www.list.am/en/category/56",
+                price="",
+                location="Ереван и другие города",
+                source="List.am",
+            ),
+        ],
+    },
+    "montenegro": {
+        "cities": [],
+        "city_aliases": {},
+        "collector": None,  # pending — see TaskList
+        "fallback_listings": [
+            PropertyListing(
+                title="🔍 Недвижимость в Черногории на Nekretnine.me",
+                url="https://www.nekretnine.me",
+                price="",
+                location="Подгорица, Будва и другие города",
+                source="Nekretnine.me",
+            ),
+        ],
+    },
+}

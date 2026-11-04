@@ -18,20 +18,27 @@ def test_bot_system_prompt():
 
 
 def test_config():
-    """Test that configuration is properly set up."""
-    from config import WHITELIST_DOMAINS, RSS_FEEDS, MSP_KEYWORDS
+    """Test that configuration is properly set up (Serbia, the reference country)."""
+    import config
 
-    assert len(WHITELIST_DOMAINS) > 0
-    assert len(RSS_FEEDS) > 0
-    assert len(MSP_KEYWORDS) > 0
+    whitelist = config.get_whitelist_domains("serbia")
+    feeds = config.get_rss_feeds("serbia")
+    keywords = config.get_all_keywords("serbia")
 
-    serbian_domains = [d for d in WHITELIST_DOMAINS if "rs" in d or "serbia" in d]
+    assert len(whitelist) > 0
+    assert len(feeds) > 0
+    assert len(keywords) > 0
+
+    serbian_domains = [d for d in whitelist if "rs" in d or "serbia" in d]
     assert len(serbian_domains) > 0, "Whitelist should include at least one Serbian domain"
 
 
 def test_parser_keywords():
-    """Test that parser scores keywords correctly."""
+    """Test that parser scores keywords correctly (Serbia, the reference country)."""
+    import config
     from parser import _score
+
+    keywords = config.get_all_keywords("serbia")
 
     test_cases = [
         ("Работа в Сербии", True),
@@ -43,7 +50,7 @@ def test_parser_keywords():
     ]
 
     for title, expected_relevant in test_cases:
-        score = _score({"title": title, "summary": ""})
+        score = _score({"title": title, "summary": ""}, keywords)
         relevant = score > 0
         assert relevant == expected_relevant, (
             f"'{title}': expected relevant={expected_relevant}, got score={score}"

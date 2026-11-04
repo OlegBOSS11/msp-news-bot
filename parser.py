@@ -10,19 +10,15 @@ from urllib.parse import urlparse
 import aiohttp
 import feedparser
 
-from config import (
-    MAX_NEWS,
-    MSP_KEYWORDS,
-    RSS_FEEDS,
-    WHITELIST_DOMAINS,
-)
+import config
+from config import MAX_NEWS
 
 logger = logging.getLogger(__name__)
 
 MOSCOW_TZ = timezone(timedelta(hours=3))
 
 
-def _domain_in_whitelist(url: str) -> bool:
+def _domain_in_whitelist(url: str, whitelist_domains: set[str]) -> bool:
     """Check whether the URL's domain is in (or a subdomain of) the whitelist.
 
     Exact match or a proper subdomain only — plain `.endswith(d)` would
@@ -36,17 +32,17 @@ def _domain_in_whitelist(url: str) -> bool:
             return False
         return any(
             host == domain or host.endswith(f".{domain}")
-            for domain in WHITELIST_DOMAINS
+            for domain in whitelist_domains
         )
     except Exception:
         return False
 
 
-def _entry_link(entry: dict) -> str | None:
+def _entry_link(entry: dict, whitelist_domains: set[str]) -> str | None:
     """Extract the first link whose domain is whitelisted, or None.
 
     No longer falls back to an unwhitelisted link — a feed entry can point
-    anywhere in its <link>/<links>, and the whole point of WHITELIST_DOMAINS
+    anywhere in its <link>/<links>, and the whole point of the whitelist
     is to bound what URLs this bot will ever forward to users.
     """
     links = entry.get("links", [])
@@ -54,7 +50,7 @@ def _entry_link(entry: dict) -> str | None:
         links = [{"href": entry["link"]}]
     for link in links:
         href = link.get("href", "")
-        if _domain_in_whitelist(href):
+        if _domain_in_whitelist(href, whitelist_domains):
             return href
     return None
 
@@ -91,14 +87,14 @@ def _parse_pub_date(entry: dict) -> datetime | None:
     return None
 
 
-def _score(entry: dict) -> int:
-    """How many MSP keywords appear in title + summary."""
+def _score(entry: dict, keywords: list[str]) -> int:
+    """How many relocation-relevant keywords appear in title + summary."""
     text = (
         (entry.get("title") or "")
         + " "
         + (entry.get("summary") or entry.get("description") or "")
     ).lower()
-    return sum(1 for kw in MSP_KEYWORDS if kw.lower() in text)
+    return sum(1 for kw in keywords if kw.lower() in text)
 
 
 def _is_safe_media_url(url: str) -> bool:
@@ -168,6 +164,8 @@ def _entry_summary(entry: dict) -> str:
 async def _fetch_feed(
     session: aiohttp.ClientSession,
     feed_cfg: dict[str, str],
+    whitelist_domains: set[str],
+    keywords: list[str],
 ) -> list[dict]:
     """Fetch and parse one RSS/Atom feed."""
     url = feed_cfg["url"]
@@ -203,7 +201,7 @@ async def _fetch_feed(
         # One malformed entry (weird date format, missing fields, whatever)
         # must not take out the rest of an otherwise-good feed.
         try:
-            link = _entry_link(entry)
+            link = _entry_link(entry, whitelist_domains)
             if not link:
                 continue
 
@@ -217,7 +215,7 @@ async def _fetch_feed(
                     "title": (entry.get("title") or "Без заголовка").strip(),
                     "link": link,
                     "summary": _entry_summary(entry),
-                    "score": _score(entry),
+                    "score": _score(entry, keywords),
                     "source": name,
                     "image_url": _entry_image(entry),
                 }
@@ -228,14 +226,21 @@ async def _fetch_feed(
     return results
 
 
-async def collect_news() -> list[dict]:
-    """Gather, filter, and rank news from all whitelisted feeds."""
+async def collect_news(country_code: str = config.DEFAULT_COUNTRY) -> list[dict]:
+    """Gather, filter, and rank news from all whitelisted feeds for one country."""
+    rss_feeds = config.get_rss_feeds(country_code)
+    whitelist_domains = config.get_whitelist_domains(country_code)
+    keywords = config.get_all_keywords(country_code)
+
     # Force IPv4: some hosts (e.g. IPv6-less VDS) have working IPv4 routes
     # but no IPv6 route, and letting aiohttp's happy-eyeballs try IPv6 first
     # can cause intermittent connection failures instead of a clean fallback.
     connector = aiohttp.TCPConnector(family=socket.AF_INET)
     async with aiohttp.ClientSession(connector=connector) as session:
-        tasks = [_fetch_feed(session, cfg) for cfg in RSS_FEEDS]
+        tasks = [
+            _fetch_feed(session, cfg, whitelist_domains, keywords)
+            for cfg in rss_feeds
+        ]
         results = await asyncio.gather(*tasks, return_exceptions=True)
 
     all_entries: list[dict] = []
@@ -248,62 +253,24 @@ async def collect_news() -> list[dict]:
     # Filter: only entries with score > 0 (at least one relevant keyword)
     relevant = [e for e in all_entries if e["score"] > 0]
 
-    # Additional filter: news must mention Serbia or relocation-related terms
-    # to avoid showing unrelated Russian news
-    # Only Serbian-specific terms are used for filtering Russian sources
-    SERBIA_REQUIRED_TERMS = [
-        "серб", "релокац", "переезд", "внж", "пмж", "белград",
-        "nekretnine", "stan", "kuća", "iznajmljivanje", "prodaja",
-    ]
+    # Additional filter: news must mention this country or relocation-related
+    # terms, to avoid showing unrelated Russian/international news that
+    # happened to also match a generic work/finance/documents keyword.
+    required_terms = config.COUNTRIES[country_code]["required_terms"]
+    local_sources = config.get_local_source_names(country_code)
     filtered = []
     for e in relevant:
         text = (e.get("title", "") + " " + e.get("summary", "")).lower()
-        # Serbian sources (and Serbia-focused portals) always pass,
-        # general Russian/international sources must mention Serbia terms
-        if e["source"] in [
-            "n1info.rs", "blic.rs", "b92.net", "telegraf.rs", "kurir.rs",
-            "danas.rs", "nova.rs", "ruserbia.com", "russian.rs",
-        ]:
+        # This country's own local sources always pass; shared
+        # international/Russian sources must mention this country.
+        if e["source"] in local_sources:
             filtered.append(e)
-        elif any(term in text for term in SERBIA_REQUIRED_TERMS):
+        elif any(term in text for term in required_terms):
             filtered.append(e)
     relevant = filtered
 
-    # Sort by score descending, then by source priority (Serbian sources first)
-    source_priority = {
-        # Сербские источники (высший приоритет)
-        "n1info.rs": 0,
-        "b92.net": 0,
-        "blic.rs": 0,
-        "telegraf.rs": 0,
-        "rsponline.rs": 0,
-        "novosti.rs": 0,
-        "politika.rs": 0,
-        "tanjug.rs": 0,
-        "serbia.travel": 0,
-        "investserbia.org": 0,
-        "kurir.rs": 0,
-        "danas.rs": 0,
-        "nova.rs": 0,
-        # Международные источники
-        "reuters.com": 1,
-        "bbc.com": 1,
-        "bbci.co.uk": 1,
-        "euronews.com": 1,
-        # Российские источники (контекст)
-        "rbc.ru": 2,
-        "kommersant.ru": 2,
-        "vedomosti.ru": 2,
-        "tass.ru": 2,
-        "ria.ru": 2,
-        "radiosputnik.ru": 2,
-        "rg.ru": 2,
-        # Русскоязычные источники о Сербии
-        "serbiarus.com": 1,
-        "rsmedia.ru": 1,
-        "ruserbia.com": 1,
-        "russian.rs": 1,
-    }
+    # Sort by score descending, then by source priority (local sources first)
+    source_priority = config.get_source_priority(country_code)
     relevant.sort(
         key=lambda e: (-e["score"], source_priority.get(e["source"], 9)),
     )

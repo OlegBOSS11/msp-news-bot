@@ -14,7 +14,7 @@ GIGACHAT_CREDENTIALS: str = os.environ["GIGACHAT_CREDENTIALS"]
 # Format: socks5://user:password@host:port
 TELEGRAM_PROXY_URL: str | None = os.environ.get("TELEGRAM_PROXY_URL") or None
 
-# Optional: translate Serbian news via Ollama Cloud's free tier
+# Optional: translate news via Ollama Cloud's free tier
 # (OpenAI-compatible API, https://ollama.com/settings/keys) instead of
 # GigaChat — costs nothing while the free quota lasts. Falls back to
 # GigaChat automatically (translator.py) if this isn't set or a call
@@ -23,280 +23,252 @@ TELEGRAM_PROXY_URL: str | None = os.environ.get("TELEGRAM_PROXY_URL") or None
 OLLAMA_API_KEY: str | None = os.environ.get("OLLAMA_API_KEY") or None
 OLLAMA_MODEL: str = os.environ.get("OLLAMA_MODEL", "gpt-oss:20b-cloud")
 
-# --- Serbian news sources (for translation) ---
-SERBIAN_NEWS_SOURCES: list[str] = [
-    "n1info.rs", "blic.rs", "telegraf.rs", "b92.net", "kurir.rs", "danas.rs", "nova.rs",
-]
+MAX_NEWS: int = 15
 
-# --- Whitelist domains (only these are parsed) ---
-WHITELIST_DOMAINS: set[str] = {
-    # Сербские источники
-    "rsponline.rs",
-    "blic.rs",
-    "novosti.rs",
-    "politika.rs",
-    "n1info.rs",
-    "b92.net",
-    "tanjug.rs",
-    "serbia.travel",
-    "investserbia.org",
-    "telegraf.rs",
-    "kurir.rs",
-    "danas.rs",
-    "nova.rs",
-    # Русскоязычные источники о Сербии
-    "serbiarus.com",
-    "rsmedia.ru",
-    "ruserbia.com",
-    "russian.rs",  # Русская диаспора Сербии — гайды и новости по релокации
-    # Международные источники
-    "reuters.com",
-    "bbc.com",
-    "bbci.co.uk",  # BBC's actual RSS feeds are served from this domain
-    "euronews.com",
-    # Российские источники (для сравнения/контекста)
-    "rbc.ru",
-    "kommersant.ru",
-    "vedomosti.ru",
-    "tass.ru",
-    "ria.ru",
-    "radiosputnik.ru",
-    "rg.ru",
+# Moscow timezone name — digest send time is anchored to this regardless
+# of which country(ies) a given run covers, since the audience reads the
+# digest in Moscow-time habits regardless of where they relocated to.
+TIMEZONE: str = "Europe/Moscow"
+
+DEFAULT_COUNTRY: str = "serbia"
+
+
+# --- International / Russian-context sources shared by every country ---
+# These aren't about any one destination country, so every country's feed
+# list includes them — but an article from one of them only reaches a
+# given country's users if it also matches that country's `required_terms`
+# (see parser.collect_news()), the same way it always worked for Serbia.
+SHARED_INTL_FEEDS: list[dict[str, str]] = [
+    {"name": "euronews.com", "url": "https://ru.euronews.com/rss"},
+    {"name": "bbci.co.uk", "url": "http://feeds.bbci.co.uk/russian/rss.xml"},
+]
+SHARED_RU_FEEDS: list[dict[str, str]] = [
+    {"name": "tass.ru", "url": "https://tass.ru/rss/v2.xml"},
+    {"name": "ria.ru", "url": "https://ria.ru/export/rss2/archive/index.xml"},
+    {"name": "radiosputnik.ru", "url": "https://radiosputnik.ru/export/rss2/archive/index.xml"},
+    {"name": "rg.ru", "url": "https://rg.ru/xml/index.xml"},
+]
+SHARED_WHITELIST_DOMAINS: set[str] = {
+    "reuters.com", "bbc.com", "bbci.co.uk", "euronews.com",
+    "rbc.ru", "kommersant.ru", "vedomosti.ru", "tass.ru", "ria.ru",
+    "radiosputnik.ru", "rg.ru",
+}
+# Priority bucket used to sort the digest — lower sorts first. Local
+# (country-specific) sources always get bucket 0 (see COUNTRIES below);
+# these are the buckets for the shared sources every country includes.
+SHARED_SOURCE_PRIORITY: dict[str, int] = {
+    "euronews.com": 1, "bbci.co.uk": 1, "reuters.com": 1, "bbc.com": 1,
+    "tass.ru": 2, "ria.ru": 2, "radiosputnik.ru": 2, "rg.ru": 2,
 }
 
-# --- RSS / Atom feeds to poll ---
-# Only feeds whose netloc is in WHITELIST_DOMAINS.
-# Updated for Serbian relocation news (July 2026)
-RSS_FEEDS: list[dict[str, str]] = [
-    # --- Сербские новости ---
-    {
-        "name": "n1info.rs",
-        "url": "https://n1info.rs/feed/",
-    },
-    {
-        "name": "blic.rs",
-        "url": "https://www.blic.rs/rss",
-    },
-    {
-        "name": "telegraf.rs",
-        "url": "https://www.telegraf.rs/rss",
-    },
-    {
-        "name": "kurir.rs",
-        "url": "https://www.kurir.rs/rss/",
-    },
-    {
-        "name": "danas.rs",
-        "url": "https://danas.rs/feed/",
-    },
-    {
-        "name": "nova.rs",
-        "url": "https://nova.rs/feed/",
-    },
-    # --- Русскоязычные источники о Сербии ---
-    {
-        "name": "ruserbia.com",
-        "url": "https://ruserbia.com/feed/",
-    },
-    {
-        "name": "russian.rs",
-        "url": "https://russian.rs/feed/",
-    },
-    # --- Международные источники ---
-    {
-        "name": "euronews.com",
-        "url": "https://ru.euronews.com/rss",
-    },
-    {
-        "name": "bbci.co.uk",
-        "url": "http://feeds.bbci.co.uk/russian/rss.xml",
-    },
-    # --- Российские источники (контекст) ---
-    {
-        "name": "tass.ru",
-        "url": "https://tass.ru/rss/v2.xml",
-    },
-    {
-        "name": "ria.ru",
-        "url": "https://ria.ru/export/rss2/archive/index.xml",
-    },
-    {
-        "name": "radiosputnik.ru",
-        "url": "https://radiosputnik.ru/export/rss2/archive/index.xml",
-    },
-    {
-        "name": "rg.ru",
-        "url": "https://rg.ru/xml/index.xml",
-    },
-]
-
-# --- MSP keywords for relevance filtering ---
-# Applied to RAW feed text (parser._score(), before translation) — a
-# Serbian-language article about e.g. visas never gets translated at all
-# unless it scores > 0 here first, so every category below needs Serbian
-# terms alongside the Russian ones, not just real estate (which already
-# had them). Missing this meant Serbian-source articles about visas/ВНЖ/
-# taxes/work/education silently never reached anyone, no matter how
-# relevant, while real-estate articles from the same sources sailed
-# through — verified: "Nove vize za strane radnike u Srbiji" scored 0,
-# "Iznajmljivanje stanova u Beogradu" scored 2, from the same outlet.
-MSP_KEYWORDS: list[str] = [
-    # Сербия и релокация (русские термины)
-    "сербия",
-    "сербск",
-    "релокац",
-    "переезд",
-    "миграц",
-    "виза",
-    "внж",
-    "пмж",
-    "гражданств",
-    # Сербия и релокация (сербские термины)
-    "srbij",
-    "viz",  # viza/vize/vizu
-    "borav",  # boravak/boravka/boravište/boravišni — case-inflection-safe
-    "državljanstv",
-    "stran",  # stranci/strancu/stranaca — plural genitive drops the "c",
-              # a normal Slavic vowel/consonant alternation "stranci"→"stranaca"
-    "iselj",  # iseljenje — emigration
-    # Работа (русские термины)
-    "работа",
-    "трудоустро",
-    "зарплат",
-    "резюме",
-    "ваканси",
-    "работодател",
-    # Работа (сербские термины)
-    "posao",
-    "poslovi",
-    "zaposlenj",
-    "radno mesto",
-    "radnik",
-    "plata",
-    "poslodavac",
-    # Недвижимость (русские термины)
-    "недвижим",
-    "аренд",
-    "квартир",
-    "дом",
-    "покупк",
-    "продаж",
-    "жилье",
-    "жилая",
-    "квартал",
-    "район",
-    "ремонт",
-    "строительств",
-    # Недвижимость (сербские термины)
-    "nekretnine",
-    "stan",
-    "kuća",
-    "iznajmljivanje",
-    "prodaja",
-    "kupovina",
-    "gradnja",
-    "adaptacija",
-    "enterijer",
-    "eksterijer",
-    # Образование (русские термины)
-    "образован",
-    "школ",
-    "университет",
-    "учеб",
-    "детск",
-    # Образование (сербские термины)
-    "škol",
-    "univerzitet",
-    "obrazovanj",
-    "vrtić",  # детский сад
-    "student",
-    # Финансы (русские термины)
-    "банк",
-    "налог",
-    "счет",
-    "перевод",
-    "валют",
-    # Финансы (сербские термины)
-    "bank",
-    "porez",
-    "račun",
-    "valut",
-    # Документы (русские термины)
-    "документ",
-    "паспорт",
-    "регистрац",
-    "справк",
-    # Документы (сербские термины)
-    "dokument",
-    "pasoš",
-    "registracij",
-    "potvrd",  # potvrda — справка
-    "dozvola",  # разрешение/справка (шире, чем dozvola za boravak выше)
-    # Новости (русские термины)
-    "новост",
-    "закон",
-    "изменен",
-    "ограничен",
-    # Новости (сербские термины)
-    "zakon",
-    "izmen",  # izmena/izmene — изменения
-    "ograničenj",
-]
-
-# --- News categories for the personalized digest ---
-# Each item in the digest is tagged with every category whose keywords
-# match its title/summary (an item can belong to more than one); items
-# matching none of these fall into "general". Users pick which categories
-# they want to receive via /settings — see bot.py's topic toggle menu.
+# --- Keyword categories shared across every country (Russian terms only — ---
+# a Russian-speaking user's own queries and a digest's Russian-language
+# articles always match these regardless of destination country). Each
+# country adds its own `local_keywords` on top (local-language terms +
+# the country's own name) for relevance-scoring Serbian/Georgian/Turkish/
+# Armenian/Montenegrin-language source articles that haven't been
+# translated yet (parser._score() runs on the raw feed text).
 NEWS_CATEGORIES: dict[str, dict] = {
-    "serbia": {
-        "label": "🇷🇸 Сербия и релокация",
-        "keywords": [
-            "сербия", "сербск", "релокац", "переезд", "миграц",
-            "виза", "внж", "пмж", "гражданств",
-            "srbij", "viz", "borav", "državljanstv", "stran", "iselj",
+    "country": {
+        # No static label — formatted per-country as "{flag} {name} и
+        # релокация" by get_category_label() below.
+        "shared_keywords": [
+            "релокац", "переезд", "миграц", "виза", "внж", "пмж", "гражданств",
         ],
     },
     "work": {
         "label": "💼 Работа",
-        "keywords": [
+        "shared_keywords": [
             "работа", "трудоустро", "зарплат", "резюме", "ваканси", "работодател",
-            "posao", "poslovi", "zaposlenj", "radno mesto", "radnik", "plata", "poslodavac",
         ],
     },
     "realestate": {
         "label": "🏠 Недвижимость",
-        "keywords": [
+        "shared_keywords": [
             "недвижим", "аренд", "квартир", "дом", "покупк", "продаж",
-            "жилье", "жилая", "строительств",
-            "nekretnine", "stan", "kuća", "iznajmljivanje", "prodaja", "kupovina",
+            "жилье", "жилая", "квартал", "район", "ремонт", "строительств",
         ],
     },
     "education": {
         "label": "🎓 Образование",
-        "keywords": [
+        "shared_keywords": [
             "образован", "школ", "университет", "учеб", "детск",
-            "škol", "univerzitet", "obrazovanj", "vrtić", "student",
         ],
     },
     "finance": {
         "label": "💰 Финансы и налоги",
-        "keywords": ["банк", "налог", "счет", "перевод", "валют", "bank", "porez", "račun", "valut"],
+        "shared_keywords": ["банк", "налог", "счет", "перевод", "валют"],
     },
     "documents": {
         "label": "📄 Документы",
-        "keywords": [
+        "shared_keywords": [
             "документ", "паспорт", "регистрац", "справк",
-            "dokument", "pasoš", "registracij", "potvrd", "dozvola",
         ],
     },
     "general": {
         "label": "📰 Общие новости",
-        "keywords": [],  # catch-all for items matching no other category
+        "shared_keywords": [],  # catch-all for items matching no other category
     },
 }
 
-MAX_NEWS: int = 15
 
-# Moscow timezone name
-TIMEZONE: str = "Europe/Moscow"
+def get_category_label(country_code: str, category_key: str) -> str:
+    """Human-readable label for a category, country-aware for "country"."""
+    cat = NEWS_CATEGORIES.get(category_key, {})
+    if category_key == "country":
+        info = COUNTRIES.get(country_code, COUNTRIES[DEFAULT_COUNTRY])
+        return f"{info['flag']} {info['name']} и релокация"
+    return cat.get("label", category_key)
+
+
+def get_category_keywords(country_code: str, category_key: str) -> list[str]:
+    """Shared (Russian) + country-local keywords for one category."""
+    shared = NEWS_CATEGORIES.get(category_key, {}).get("shared_keywords", [])
+    info = COUNTRIES.get(country_code, COUNTRIES[DEFAULT_COUNTRY])
+    local = info["local_keywords"].get(category_key, [])
+    return shared + local
+
+
+def get_all_keywords(country_code: str) -> list[str]:
+    """Flat list of every keyword (every category) for scoring relevance —
+    the country-aware equivalent of the old flat MSP_KEYWORDS list."""
+    out: list[str] = []
+    for key in NEWS_CATEGORIES:
+        out.extend(get_category_keywords(country_code, key))
+    return out
+
+
+def get_rss_feeds(country_code: str) -> list[dict[str, str]]:
+    info = COUNTRIES.get(country_code, COUNTRIES[DEFAULT_COUNTRY])
+    return info["local_feeds"] + SHARED_INTL_FEEDS + SHARED_RU_FEEDS
+
+
+def get_whitelist_domains(country_code: str) -> set[str]:
+    info = COUNTRIES.get(country_code, COUNTRIES[DEFAULT_COUNTRY])
+    return info["local_domains"] | SHARED_WHITELIST_DOMAINS
+
+
+def get_source_priority(country_code: str) -> dict[str, int]:
+    """Lower sorts first. Local sources are bucket 0, shared intl/RU
+    sources keep their bucket from SHARED_SOURCE_PRIORITY."""
+    info = COUNTRIES.get(country_code, COUNTRIES[DEFAULT_COUNTRY])
+    priority = dict(SHARED_SOURCE_PRIORITY)
+    for feed in info["local_feeds"]:
+        priority[feed["name"]] = 0
+    return priority
+
+
+def get_local_source_names(country_code: str) -> set[str]:
+    """Source names that always pass the required_terms filter in
+    parser.collect_news() — i.e. every local source for this country."""
+    info = COUNTRIES.get(country_code, COUNTRIES[DEFAULT_COUNTRY])
+    return {feed["name"] for feed in info["local_feeds"]}
+
+
+# --- Per-country registry ---
+# Adding a country means adding one entry here (+ a real-estate collector
+# in real_estate.py, registered in real_estate.COUNTRY_REAL_ESTATE).
+#
+# local_feeds / local_domains: that country's own news sources (local-
+#   language outlets + any dedicated Russian-language diaspora site, the
+#   Serbia precedent being ruserbia.com/russian.rs).
+# local_keywords: per-category local-language terms (see NEWS_CATEGORIES
+#   docstring above) — merged with the shared Russian terms.
+# required_terms: when a SHARED_INTL_FEEDS/SHARED_RU_FEEDS article (i.e.
+#   not already about this country specifically) is considered for this
+#   country's digest, it must mention one of these terms to pass. Local
+#   sources (local_feeds) always pass regardless.
+COUNTRIES: dict[str, dict] = {
+    "serbia": {
+        "name": "Сербия",
+        "flag": "🇷🇸",
+        "local_domains": {
+            "rsponline.rs", "blic.rs", "novosti.rs", "politika.rs", "n1info.rs",
+            "b92.net", "tanjug.rs", "serbia.travel", "investserbia.org",
+            "telegraf.rs", "kurir.rs", "danas.rs", "nova.rs",
+            "serbiarus.com", "rsmedia.ru", "ruserbia.com", "russian.rs",
+        },
+        "local_feeds": [
+            {"name": "n1info.rs", "url": "https://n1info.rs/feed/"},
+            {"name": "blic.rs", "url": "https://www.blic.rs/rss"},
+            {"name": "telegraf.rs", "url": "https://www.telegraf.rs/rss"},
+            {"name": "kurir.rs", "url": "https://www.kurir.rs/rss/"},
+            {"name": "danas.rs", "url": "https://danas.rs/feed/"},
+            {"name": "nova.rs", "url": "https://nova.rs/feed/"},
+            {"name": "ruserbia.com", "url": "https://ruserbia.com/feed/"},
+            {"name": "russian.rs", "url": "https://russian.rs/feed/"},
+        ],
+        "local_keywords": {
+            "country": ["сербия", "сербск", "srbij", "viz", "borav", "državljanstv", "stran", "iselj"],
+            "work": ["posao", "poslovi", "zaposlenj", "radno mesto", "radnik", "plata", "poslodavac"],
+            "realestate": ["nekretnine", "stan", "kuća", "iznajmljivanje", "prodaja", "kupovina", "gradnja", "adaptacija", "enterijer", "eksterijer"],
+            "education": ["škol", "univerzitet", "obrazovanj", "vrtić", "student"],
+            "finance": ["bank", "porez", "račun", "valut"],
+            "documents": ["dokument", "pasoš", "registracij", "potvrd", "dozvola"],
+        },
+        "required_terms": [
+            "серб", "релокац", "переезд", "внж", "пмж", "белград",
+            "nekretnine", "stan", "kuća", "iznajmljivanje", "prodaja",
+        ],
+    },
+    "georgia": {
+        "name": "Грузия",
+        "flag": "🇬🇪",
+        "local_domains": set(),  # filled in once sources are verified — see TaskList
+        "local_feeds": [],
+        "local_keywords": {
+            "country": ["грузия", "грузинск", "тбилиси", "sakartvelo", "tbilisi"],
+            "work": [],
+            "realestate": [],
+            "education": [],
+            "finance": [],
+            "documents": [],
+        },
+        "required_terms": ["грузи", "тбилиси", "релокац", "переезд", "внж", "пмж"],
+    },
+    "turkey": {
+        "name": "Турция",
+        "flag": "🇹🇷",
+        "local_domains": set(),
+        "local_feeds": [],
+        "local_keywords": {
+            "country": ["турция", "турецк", "стамбул", "анталья", "turkiye", "istanbul"],
+            "work": [],
+            "realestate": [],
+            "education": [],
+            "finance": [],
+            "documents": [],
+        },
+        "required_terms": ["турци", "турецк", "стамбул", "анталь", "релокац", "переезд", "внж", "пмж", "икамет"],
+    },
+    "armenia": {
+        "name": "Армения",
+        "flag": "🇦🇲",
+        "local_domains": set(),
+        "local_feeds": [],
+        "local_keywords": {
+            "country": ["армения", "армянск", "ереван", "hayastan", "yerevan"],
+            "work": [],
+            "realestate": [],
+            "education": [],
+            "finance": [],
+            "documents": [],
+        },
+        "required_terms": ["армени", "ереван", "релокац", "переезд", "внж", "пмж"],
+    },
+    "montenegro": {
+        "name": "Черногория",
+        "flag": "🇲🇪",
+        "local_domains": set(),
+        "local_feeds": [],
+        "local_keywords": {
+            "country": ["черногория", "черногорск", "подгориц", "будв", "crna gora", "podgorica"],
+            "work": [],
+            "realestate": [],
+            "education": [],
+            "finance": [],
+            "documents": [],
+        },
+        "required_terms": ["черногор", "подгориц", "будв", "котор", "релокац", "переезд", "внж", "пмж"],
+    },
+}

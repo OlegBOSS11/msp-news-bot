@@ -38,7 +38,7 @@ from real_estate import (
 )
 from serbia_search import get_serbia_answer
 from telegram_format import split_telegram_message, telegram_link, telegram_text
-from translator import translate_to_russian, detect_language
+from translator import translate_to_russian
 from url_safety import is_safe_to_fetch
 
 logging.basicConfig(
@@ -150,11 +150,13 @@ def main_menu_kb() -> InlineKeyboardMarkup:
 async def settings_topics_kb(user_id: int) -> InlineKeyboardMarkup:
     """Checkbox-style toggle list of news categories for /settings."""
     disabled = await database.get_disabled_topics(user_id)
+    country = await database.get_user_country(user_id) or config.DEFAULT_COUNTRY
     rows = []
-    for key, cat in config.NEWS_CATEGORIES.items():
+    for key in config.NEWS_CATEGORIES:
         mark = "⬜" if key in disabled else "✅"
+        label = config.get_category_label(country, key)
         rows.append([InlineKeyboardButton(
-            text=f"{mark} {cat['label']}", callback_data=f"topic_toggle:{key}",
+            text=f"{mark} {label}", callback_data=f"topic_toggle:{key}",
         )])
     rows.append([InlineKeyboardButton(text="◀️ Назад", callback_data="cmd_start")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
@@ -241,18 +243,18 @@ def real_estate_filters_kb(city: str, deal: str, price_dir: str, date_dir: str) 
 
 # --- News formatting ---
 
-def _categorize_item(title: str, summary: str) -> set[str]:
+def _categorize_item(title: str, summary: str, country: str) -> set[str]:
     """Which NEWS_CATEGORIES keys this item's text matches (never empty)."""
     text = (title + " " + summary).lower()
     matched = {
-        key for key, cat in config.NEWS_CATEGORIES.items()
-        if cat["keywords"] and any(kw in text for kw in cat["keywords"])
+        key for key in config.NEWS_CATEGORIES
+        if (kws := config.get_category_keywords(country, key)) and any(kw in text for kw in kws)
     }
     return matched or {"general"}
 
 
-async def _collect_fresh_news() -> list[dict]:
-    """Collect today's relevant news.
+async def _collect_fresh_news(country: str) -> list[dict]:
+    """Collect today's relevant news for one country.
 
     collect_news() already limits results to the last 24h. This used to
     also drop anything in the global `sent_news` log, but that made
@@ -262,29 +264,29 @@ async def _collect_fresh_news() -> list[dict]:
     database.get_user_sent_links/mark_user_sent), so this is unfiltered.
     """
     try:
-        return await collect_news()
+        return await collect_news(country)
     except Exception as exc:
-        logger.error("Failed to collect news: %s", exc, exc_info=True)
+        logger.error("Failed to collect news for %s: %s", country, exc, exc_info=True)
         return []
 
 
-async def _prepare_digest_items(fresh: list[dict]) -> list[dict]:
+async def _prepare_digest_items(fresh: list[dict], country: str) -> list[dict]:
     """Translate (once) and tag each item with its news categories.
 
     Done once per digest run regardless of how many subscribers there are —
     per-user personalization only filters this shared, already-prepared list.
+
+    Translation is unconditional (translate_to_russian no-ops quickly for
+    text that's already predominantly Russian, before any network call) —
+    gating it on detect_language() == "serbian" used to mean an article in
+    Georgian/Armenian/Turkish script never got translated at all, since
+    that heuristic only recognizes Cyrillic vs. Latin.
     """
     prepared = []
     for item in fresh:
-        title = item["title"]
-        summary = item.get("summary", "")
+        title = await translate_to_russian(item["title"])
+        summary = await translate_to_russian(item.get("summary", ""))
         source = item["source"]
-
-        if source in config.SERBIAN_NEWS_SOURCES:
-            if detect_language(title) == "serbian":
-                title = await translate_to_russian(title)
-            if detect_language(summary) == "serbian":
-                summary = await translate_to_russian(summary)
 
         prepared.append({
             "title": title,
@@ -292,15 +294,16 @@ async def _prepare_digest_items(fresh: list[dict]) -> list[dict]:
             "link": item["link"],
             "source": source,
             "image_url": item.get("image_url"),
-            "categories": _categorize_item(title, summary),
+            "categories": _categorize_item(title, summary, country),
         })
     return prepared
 
 
-def _digest_header_text(count: int) -> str:
+def _digest_header_text(count: int, country: str) -> str:
     today = datetime.now(MOSCOW_TZ).strftime("%d.%m.%Y")
+    info = config.COUNTRIES.get(country, config.COUNTRIES[config.DEFAULT_COUNTRY])
     return (
-        f"📊 <b>Ежедневная сводка о Сербии на {today}.</b>\n"
+        f"📊 <b>Ежедневная сводка — {info['flag']} {info['name']}, {today}.</b>\n"
         f"Актуальные новости для релокации.\n"
         f"Новостей по вашим темам: {count}"
     )
@@ -363,7 +366,7 @@ async def _send_digest_item(chat_id: int, idx: int, item: dict) -> bool:
 
 
 async def _send_personalized_digest(
-    chat_id: int, user_id: int, items: list[dict], record_sent: bool,
+    chat_id: int, user_id: int, items: list[dict], record_sent: bool, country: str,
 ) -> bool:
     """Send only the items matching this user's enabled topics.
 
@@ -391,7 +394,7 @@ async def _send_personalized_digest(
 
     try:
         await bot.send_message(
-            chat_id=chat_id, text=_digest_header_text(len(candidates)),
+            chat_id=chat_id, text=_digest_header_text(len(candidates), country),
             parse_mode="HTML", disable_web_page_preview=True,
         )
     except Exception as exc:
@@ -411,36 +414,48 @@ async def send_daily_digest() -> None:
     personalized per user by their enabled news topics and by what they've
     already been sent (database.user_sent_news).
 
+    News is collected once per country (not once per user) — every user of
+    a given country shares the same prepared item list, same as before
+    multi-country support, just grouped by country now instead of being a
+    single implicit "Serbia" pass.
+
     Called only by the 20:00 scheduler job.
     """
-    logger.info("Starting daily digest collection...")
-    fresh = await _collect_fresh_news()
-    if not fresh:
-        logger.info("No new MSP news found for today.")
-        return
+    total_sent = 0
+    total_users = 0
+    for country in config.COUNTRIES:
+        user_ids = await database.get_user_ids_by_country(country)
+        if not user_ids:
+            continue
+        total_users += len(user_ids)
 
-    items = await _prepare_digest_items(fresh)
+        logger.info("Starting daily digest collection for %s...", country)
+        fresh = await _collect_fresh_news(country)
+        if not fresh:
+            logger.info("No new relevant news found for %s today.", country)
+            continue
 
-    # Record-keeping for /news and /status — not used to gate delivery
-    # anymore (see _collect_fresh_news / _send_personalized_digest).
-    for item in fresh:
-        try:
-            await database.mark_sent(item["link"], item["title"])
-        except Exception as exc:
-            logger.warning("DB mark_sent failed: %s", exc)
+        items = await _prepare_digest_items(fresh, country)
+
+        # Record-keeping for /news and /status — not used to gate delivery
+        # anymore (see _collect_fresh_news / _send_personalized_digest).
+        for item in fresh:
+            try:
+                await database.mark_sent(item["link"], item["title"])
+            except Exception as exc:
+                logger.warning("DB mark_sent failed: %s", exc)
+
+        for user_id in user_ids:
+            if await _send_personalized_digest(user_id, user_id, items, record_sent=True, country=country):
+                total_sent += 1
+            await asyncio.sleep(0.05)  # stay well under Telegram's rate limits
+
+        logger.info("Digest (%s) sent to subscribers (%d items collected).", country, len(fresh))
 
     await database.prune_old_user_sent_news()
-
-    user_ids = await database.get_all_user_ids()
-    if not user_ids:
+    if not total_users:
         logger.warning("No subscribed users found — digest was not sent to anyone.")
-    sent_count = 0
-    for user_id in user_ids:
-        if await _send_personalized_digest(user_id, user_id, items, record_sent=True):
-            sent_count += 1
-        await asyncio.sleep(0.05)  # stay well under Telegram's rate limits
-
-    logger.info("Digest sent to %d/%d subscribers (%d items collected).", sent_count, len(user_ids), len(fresh))
+    logger.info("Digest run complete: sent to %d/%d subscribers total.", total_sent, total_users)
 
 
 async def send_personal_digest(chat_id: int) -> bool:
@@ -455,13 +470,14 @@ async def send_personal_digest(chat_id: int) -> bool:
     (either no fresh news at all, or none matched this user's enabled topics).
     """
     logger.info("Collecting personal digest for chat %s...", chat_id)
-    fresh = await _collect_fresh_news()
+    # Private chats: chat_id == user_id, safe to reuse for topic/country lookup.
+    country = await database.get_user_country(chat_id) or config.DEFAULT_COUNTRY
+    fresh = await _collect_fresh_news(country)
     if not fresh:
         return False
 
-    items = await _prepare_digest_items(fresh)
-    # Private chats: chat_id == user_id, safe to reuse for topic lookup.
-    return await _send_personalized_digest(chat_id, chat_id, items, record_sent=False)
+    items = await _prepare_digest_items(fresh, country)
+    return await _send_personalized_digest(chat_id, chat_id, items, record_sent=False, country=country)
 
 
 # --- Welcome message ---
@@ -568,15 +584,8 @@ async def cmd_news(message: Message) -> None:
 
     lines = ["📰 <b>Последние новости:</b>\n"]
     for i, item in enumerate(news, 1):
-        title = item["title"]
+        title = await translate_to_russian(item["title"])
         link = item["link"]
-
-        # Check if news is from Serbian source and translate
-        if any(src in link for src in config.SERBIAN_NEWS_SOURCES):
-            lang = detect_language(title)
-            if lang == "serbian":
-                title = await translate_to_russian(title)
-
         lines.append(f"{i}. {telegram_link(link, title)}")
 
     await message.answer(
@@ -662,15 +671,8 @@ async def cb_news(callback: CallbackQuery) -> None:
         return
     lines = ["📰 <b>Последние новости:</b>\n"]
     for i, item in enumerate(news, 1):
-        title = item["title"]
+        title = await translate_to_russian(item["title"])
         link = item["link"]
-
-        # Check if news is from Serbian source and translate
-        if any(src in link for src in config.SERBIAN_NEWS_SOURCES):
-            lang = detect_language(title)
-            if lang == "serbian":
-                title = await translate_to_russian(title)
-
         lines.append(f"{i}. {telegram_link(link, title)}")
 
     await callback.message.edit_text(
@@ -701,13 +703,11 @@ async def _send_real_estate_listing(message: Message, row: dict, idx: int) -> No
     All fields come from scraped listing pages (real_estate_listings table)
     — external input, escaped before going into an HTML message.
     """
-    raw_title = row["title"]
-    if raw_title and detect_language(raw_title) == "serbian":
-        raw_title = await translate_to_russian(raw_title)
+    raw_title = await translate_to_russian(row["title"]) if row["title"] else row["title"]
     title = telegram_text(raw_title)
     price = telegram_text(row["price"]) if row["price"] else "не указана"
     raw_location = row["location"]
-    if raw_location and detect_language(raw_location) == "serbian":
+    if raw_location:
         raw_location = await translate_to_russian(raw_location)
     location = telegram_text(raw_location) if raw_location else "не указано"
     link = telegram_link(row["url"], "Подробнее")
@@ -900,7 +900,8 @@ async def cb_topic_toggle(callback: CallbackQuery) -> None:
     topic = callback.data.split(":", 1)[1]
     user_id = callback.from_user.id
     enabled = await database.toggle_topic(user_id, topic)
-    label = config.NEWS_CATEGORIES.get(topic, {}).get("label", topic)
+    country = await database.get_user_country(user_id) or config.DEFAULT_COUNTRY
+    label = config.get_category_label(country, topic)
     await callback.message.edit_reply_markup(reply_markup=await settings_topics_kb(user_id))
     await callback.answer(f"{label}: {'включено' if enabled else 'выключено'}")
 
@@ -942,10 +943,12 @@ async def handle_question(message: Message) -> None:
         # This branch fully handles its own replies (one message per listing),
         # so it saves history and returns early instead of falling through to
         # the generic answer-sending code at the end of the handler.
-        await message.answer("🔍 Ищу актуальные предложения недвижимости в Сербии...")
+        re_country = await database.get_user_country(user_id) or config.DEFAULT_COUNTRY
+        re_country_name = config.COUNTRIES[re_country]["name"]
+        await message.answer(f"🔍 Ищу актуальные предложения недвижимости в стране: {re_country_name}...")
 
         try:
-            listings, is_predefined = await search_real_estate_with_fallback(user_text)
+            listings, is_predefined = await search_real_estate_with_fallback(user_text, country=re_country)
 
             if not listings:
                 answer = "📋 <b>Популярные сайты для поиска недвижимости:</b>\n"
@@ -962,12 +965,10 @@ async def handle_question(message: Message) -> None:
 
                 # Send first listing with photo if available
                 for i, listing in enumerate(listings[:5]):
-                    title = listing.title
-                    if title and detect_language(title) == "serbian":
-                        title = await translate_to_russian(title)
+                    title = await translate_to_russian(listing.title) if listing.title else listing.title
                     price = telegram_text(listing.price) if listing.price else "не указана"
                     raw_location = listing.location
-                    if raw_location and detect_language(raw_location) == "serbian":
+                    if raw_location:
                         raw_location = await translate_to_russian(raw_location)
                     location = telegram_text(raw_location) if raw_location else "не указана"
                     caption = (
@@ -1163,15 +1164,25 @@ async def handle_voice(message: Message) -> None:
 
 # --- Main ---
 
+async def _refresh_all_real_estate() -> None:
+    """Run the real-estate collector for every country that has one wired
+    up (see real_estate.COUNTRY_REAL_ESTATE) — countries with no collector
+    yet are a cheap no-op (refresh_real_estate_database returns 0 instantly).
+    """
+    for country in config.COUNTRIES:
+        try:
+            count = await refresh_real_estate_database(country)
+            if count:
+                logger.info("Real estate collector (%s): %d listings.", country, count)
+        except Exception as exc:
+            logger.error("Real estate collector failed for %s: %s", country, exc, exc_info=True)
+
+
 async def _initial_real_estate_collection() -> None:
     """One-off startup job — see the DateTrigger job below for why this
     isn't just awaited directly in main()."""
     logger.info("Collecting real estate listings...")
-    try:
-        count = await refresh_real_estate_database()
-        logger.info("Real estate collector: %d listings on startup.", count)
-    except Exception as exc:
-        logger.error("Real estate collector failed on startup: %s", exc, exc_info=True)
+    await _refresh_all_real_estate()
 
 
 async def _initial_digest() -> None:
@@ -1208,7 +1219,7 @@ async def main() -> None:
         replace_existing=True,
     )
     scheduler.add_job(
-        refresh_real_estate_database,
+        _refresh_all_real_estate,
         trigger=IntervalTrigger(hours=6),
         id="real_estate_collector",
         replace_existing=True,

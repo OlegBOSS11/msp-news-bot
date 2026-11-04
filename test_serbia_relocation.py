@@ -90,22 +90,25 @@ class TestConfiguration:
 
     def test_serbian_sources_in_whitelist(self):
         """Whitelist should include Serbian sources."""
-        from config import WHITELIST_DOMAINS
+        import config
+        whitelist = config.get_whitelist_domains("serbia")
         serbian_domains = ["n1info.rs", "b92.net", "blic.rs"]
         for domain in serbian_domains:
-            assert domain in WHITELIST_DOMAINS, f"Missing Serbian domain: {domain}"
+            assert domain in whitelist, f"Missing Serbian domain: {domain}"
 
     def test_serbian_rss_feeds(self):
         """RSS feeds should include Serbian sources."""
-        from config import RSS_FEEDS
-        serbian_feeds = [f for f in RSS_FEEDS if "rs" in f["name"] or "serbia" in f["name"]]
+        import config
+        feeds = config.get_rss_feeds("serbia")
+        serbian_feeds = [f for f in feeds if "rs" in f["name"] or "serbia" in f["name"]]
         assert len(serbian_feeds) >= 2, "Should have at least 2 Serbian RSS feeds"
 
     def test_relocation_keywords(self):
         """Keywords should include relocation-related terms."""
-        from config import MSP_KEYWORDS
+        import config
+        keywords = config.get_all_keywords("serbia")
         relocation_keywords = ["сербия", "релокац", "переезд", "виза", "внж"]
-        found = [k for k in relocation_keywords if any(k in kw for kw in MSP_KEYWORDS)]
+        found = [k for k in relocation_keywords if any(k in kw for kw in keywords)]
         assert len(found) >= 3, f"Expected at least 3 relocation keywords, found: {found}"
 
 
@@ -129,24 +132,27 @@ class TestParser:
                     "source": "n1info.rs",
                 }
             ]
-            with patch("parser.RSS_FEEDS", [
+            with patch("config.get_rss_feeds", return_value=[
                 {"name": "n1info.rs", "url": "https://test1"},
             ]):
-                news = await collect_news()
+                news = await collect_news("serbia")
                 assert len(news) >= 1
                 assert news[0]["source"] == "n1info.rs"
 
     @pytest.mark.asyncio
     async def test_keyword_scoring(self):
         """Parser should score entries based on relocation keywords."""
+        import config
         from parser import _score
+
+        keywords = config.get_all_keywords("serbia")
 
         # Test entry with Serbian keywords
         entry_serbian = {
             "title": "Работа в Сербии для русских",
             "summary": "Новые возможности для релокации",
         }
-        score_serbian = _score(entry_serbian)
+        score_serbian = _score(entry_serbian, keywords)
         assert score_serbian > 0, "Serbian keywords should produce positive score"
 
         # Test entry without relevant keywords (using words not in keyword list)
@@ -154,7 +160,7 @@ class TestParser:
             "title": "Погода в Москве",
             "summary": "Прогноз на завтра",
         }
-        score_irrelevant = _score(entry_irrelevant)
+        score_irrelevant = _score(entry_irrelevant, keywords)
         assert score_irrelevant == 0, "Irrelevant keywords should produce zero score"
 
 
@@ -200,15 +206,15 @@ class TestRSSResilience:
                 Exception("Connection timeout"),
                 [{"title": "Test news", "link": "https://n1info.rs/test",
                   "summary": "Test", "score": 1, "source": "n1info.rs"}],
-                [{"title": "Test news 2", "link": "https://b92.net/test",
-                  "summary": "Test 2", "score": 1, "source": "b92.net"}],
+                [{"title": "Test news 2", "link": "https://blic.rs/test",
+                  "summary": "Test 2", "score": 1, "source": "blic.rs"}],
             ]
-            with patch("parser.RSS_FEEDS", [
+            with patch("config.get_rss_feeds", return_value=[
                 {"name": "failed.rs", "url": "https://test1"},
                 {"name": "n1info.rs", "url": "https://test2"},
-                {"name": "b92.net", "url": "https://test3"},
+                {"name": "blic.rs", "url": "https://test3"},
             ]):
-                news = await collect_news()
+                news = await collect_news("serbia")
                 assert len(news) == 2
 
     @pytest.mark.asyncio
@@ -217,11 +223,11 @@ class TestRSSResilience:
         from parser import collect_news
 
         with patch("parser._fetch_feed", side_effect=Exception("Network error")):
-            with patch("parser.RSS_FEEDS", [
+            with patch("config.get_rss_feeds", return_value=[
                 {"name": "test1", "url": "https://test1"},
                 {"name": "test2", "url": "https://test2"},
             ]):
-                news = await collect_news()
+                news = await collect_news("serbia")
                 assert news == []
 
 

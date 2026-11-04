@@ -129,11 +129,37 @@ async def init_db() -> None:
             "ALTER TABLE real_estate_listings ADD COLUMN city TEXT",
             "ALTER TABLE real_estate_listings ADD COLUMN deal_type TEXT",
             "ALTER TABLE real_estate_listings ADD COLUMN price_value INTEGER",
+            # Multi-country support: every row collected before this existed
+            # was Serbian (halooglasi.com) data, and SQLite applies a
+            # non-null DEFAULT to existing rows on ADD COLUMN too — so this
+            # backfills every pre-existing listing as 'serbia' for free.
+            # upsert_real_estate_listing() always passes country explicitly
+            # going forward, so the column default only ever matters here.
+            "ALTER TABLE real_estate_listings ADD COLUMN country TEXT NOT NULL DEFAULT 'serbia'",
         ):
             try:
                 await db.execute(ddl)
             except Exception:
                 pass  # column already exists
+
+        # users.country is deliberately NULLable with no column default —
+        # unlike real_estate_listings above, a NULL here is meaningful: it
+        # means "hasn't picked a country yet", which bot.py uses to decide
+        # whether to show the country-selection menu. A NOT NULL DEFAULT
+        # 'serbia' would silently default every *new* registration to
+        # Serbia too, not just backfill pre-existing rows. So: add the
+        # column bare, and only on the one run where it's actually new,
+        # backfill existing rows (everyone registered before country
+        # selection existed was using the bot for Serbia) as a one-time
+        # UPDATE in the same breath — never on subsequent runs, or it'd
+        # keep stomping real NULLs from brand new users who just haven't
+        # chosen yet.
+        try:
+            await db.execute("ALTER TABLE users ADD COLUMN country TEXT")
+            await db.execute("UPDATE users SET country = 'serbia' WHERE country IS NULL")
+        except Exception:
+            pass  # column already exists; backfill already ran
+
         await db.commit()
 
 
@@ -171,6 +197,47 @@ async def get_all_user_ids() -> list[int]:
     except Exception as exc:
         logger.error("DB get_all_user_ids error: %s", exc)
         return []
+
+
+async def get_user_ids_by_country(country: str) -> list[int]:
+    """Return the user_id of every user whose selected country matches."""
+    try:
+        async with aiosqlite.connect(DB_PATH) as db:
+            cursor = await db.execute(
+                "SELECT user_id FROM users WHERE country = ?", (country,)
+            )
+            rows = await cursor.fetchall()
+            return [row[0] for row in rows]
+    except Exception as exc:
+        logger.error("DB get_user_ids_by_country error: %s", exc)
+        return []
+
+
+async def get_user_country(user_id: int) -> str | None:
+    """Return the user's selected country, or None if they have none yet
+    (brand new user who hasn't gone through the country-selection menu)."""
+    try:
+        async with aiosqlite.connect(DB_PATH) as db:
+            cursor = await db.execute(
+                "SELECT country FROM users WHERE user_id = ?", (user_id,)
+            )
+            row = await cursor.fetchone()
+            return row[0] if row else None
+    except Exception as exc:
+        logger.error("DB get_user_country error: %s", exc)
+        return None
+
+
+async def set_user_country(user_id: int, country: str) -> None:
+    """Set/change the user's selected country."""
+    try:
+        async with aiosqlite.connect(DB_PATH) as db:
+            await db.execute(
+                "UPDATE users SET country = ? WHERE user_id = ?", (country, user_id)
+            )
+            await db.commit()
+    except Exception as exc:
+        logger.error("DB set_user_country error: %s", exc)
 
 
 async def is_sent(link: str) -> bool:
@@ -303,6 +370,7 @@ async def upsert_real_estate_listing(
     city: str | None = None,
     deal_type: str | None = None,
     price_value: int | None = None,
+    country: str = "serbia",
 ) -> None:
     """Insert a listing, or refresh it (and bump last_seen) if already known."""
     try:
@@ -311,8 +379,8 @@ async def upsert_real_estate_listing(
                 """
                 INSERT INTO real_estate_listings
                     (ad_id, title, price, location, url, image_url, source,
-                     city, deal_type, price_value, last_seen)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+                     city, deal_type, price_value, country, last_seen)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
                 ON CONFLICT(ad_id) DO UPDATE SET
                     title=excluded.title,
                     price=excluded.price,
@@ -323,18 +391,19 @@ async def upsert_real_estate_listing(
                     city=excluded.city,
                     deal_type=excluded.deal_type,
                     price_value=excluded.price_value,
+                    country=excluded.country,
                     last_seen=CURRENT_TIMESTAMP
                 """,
                 (ad_id, title, price, location, url, image_url, source,
-                 city, deal_type, price_value),
+                 city, deal_type, price_value, country),
             )
             await db.commit()
     except Exception as exc:
         logger.error("DB upsert_real_estate_listing error: %s", exc)
 
 
-async def get_real_estate_listings(limit: int = 100) -> list[dict]:
-    """Return the most recently seen real estate listings.
+async def get_real_estate_listings(limit: int = 100, country: str = "serbia") -> list[dict]:
+    """Return the most recently seen real estate listings for one country.
 
     Includes city/deal_type — callers doing their own free-text filtering
     (real_estate.search_real_estate_with_fallback) need these to match a
@@ -349,10 +418,11 @@ async def get_real_estate_listings(limit: int = 100) -> list[dict]:
                 SELECT ad_id, title, price, location, url, image_url, source,
                        city, deal_type
                 FROM real_estate_listings
+                WHERE country = ?
                 ORDER BY last_seen DESC
                 LIMIT ?
                 """,
-                (limit,),
+                (country, limit),
             )
             rows = await cursor.fetchall()
             return [dict(row) for row in rows]
@@ -367,6 +437,7 @@ async def get_real_estate_listings_filtered(
     price_dir: str | None = None,
     date_dir: str = "n",
     limit: int = 10,
+    country: str = "serbia",
 ) -> list[dict]:
     """Return listings for the real-estate menu, filtered and sorted.
 
@@ -393,15 +464,15 @@ async def get_real_estate_listings_filtered(
     order_parts.append(f"first_seen {'ASC' if date_dir == 'o' else 'DESC'}")
     order_by = ", ".join(order_parts)
 
-    conditions = []
-    params: list = []
+    conditions = ["country = ?"]
+    params: list = [country]
     if city:
         conditions.append("city = ?")
         params.append(city)
     if deal_type:
         conditions.append("deal_type = ?")
         params.append(deal_type)
-    where_clause = f"WHERE {' AND '.join(conditions)}" if conditions else ""
+    where_clause = f"WHERE {' AND '.join(conditions)}"
     params.append(limit)
 
     try:

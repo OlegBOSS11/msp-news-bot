@@ -66,12 +66,12 @@ class TestRSSResilience:
                 [{"title": "Новости Сербии 2", "link": "https://vedomosti.ru/test",
                   "summary": "Релокация в Сербию", "score": 1, "source": "vedomosti.ru"}],
             ]
-            with patch("parser.RSS_FEEDS", [
+            with patch("config.get_rss_feeds", return_value=[
                 {"name": "garant.ru", "url": "https://test1"},
                 {"name": "kommersant.ru", "url": "https://test2"},
                 {"name": "vedomosti.ru", "url": "https://test3"},
             ]):
-                news = await collect_news()
+                news = await collect_news("serbia")
                 assert len(news) == 2
 
     @pytest.mark.asyncio
@@ -80,11 +80,11 @@ class TestRSSResilience:
         from parser import collect_news
 
         with patch("parser._fetch_feed", side_effect=Exception("Network error")):
-            with patch("parser.RSS_FEEDS", [
+            with patch("config.get_rss_feeds", return_value=[
                 {"name": "test1", "url": "https://test1"},
                 {"name": "test2", "url": "https://test2"},
             ]):
-                news = await collect_news()
+                news = await collect_news("serbia")
                 assert news == []
 
     @pytest.mark.asyncio
@@ -93,8 +93,8 @@ class TestRSSResilience:
         from parser import collect_news
 
         with patch("parser._fetch_feed", return_value=[]):
-            with patch("parser.RSS_FEEDS", [{"name": "test", "url": "https://test"}]):
-                news = await collect_news()
+            with patch("config.get_rss_feeds", return_value=[{"name": "test", "url": "https://test"}]):
+                news = await collect_news("serbia")
                 assert news == []
 
 
@@ -206,7 +206,14 @@ class TestTelegramResilience:
                 # something to iterate over. Neither has been sent
                 # anything yet, and per-user delivery is not recorded
                 # here — this test only cares about broadcast resilience.
-                with patch("database.get_all_user_ids", return_value=[111, 222]):
+                # send_daily_digest() now loops every configured country;
+                # only "serbia" has subscribers here, so every other
+                # country's lookup returns empty and is skipped.
+                with patch(
+                    "database.get_user_ids_by_country",
+                    new_callable=AsyncMock,
+                    side_effect=lambda country: [111, 222] if country == "serbia" else [],
+                ):
                     with patch("database.get_disabled_topics", return_value=set()):
                         with patch("database.get_user_sent_links", return_value=set()):
                             with patch("database.mark_user_sent", new_callable=AsyncMock):
@@ -359,7 +366,7 @@ class TestNetworkResilience:
         from parser import _fetch_feed
 
         mock_session = _mock_get_raising(asyncio.TimeoutError())
-        result = await _fetch_feed(mock_session, {"name": "test", "url": "https://test"})
+        result = await _fetch_feed(mock_session, {"name": "test", "url": "https://test"}, set(), [])
         assert result == []
 
     @pytest.mark.asyncio
@@ -368,7 +375,7 @@ class TestNetworkResilience:
         from parser import _fetch_feed
 
         mock_session = _mock_get_raising(Exception("Connection refused"))
-        result = await _fetch_feed(mock_session, {"name": "test", "url": "https://test"})
+        result = await _fetch_feed(mock_session, {"name": "test", "url": "https://test"}, set(), [])
         assert result == []
 
 
@@ -437,7 +444,7 @@ class TestPerUserDigestDelivery:
                             raise Exception("send failed")
 
                     with patch("bot.bot.send_message", side_effect=header_ok_item_fails):
-                        await _send_personalized_digest(111, 111, items, record_sent=True)
+                        await _send_personalized_digest(111, 111, items, record_sent=True, country="serbia")
                         mock_mark.assert_not_called()
 
     @pytest.mark.asyncio
@@ -453,7 +460,7 @@ class TestPerUserDigestDelivery:
             with patch("database.get_user_sent_links", return_value=set()):
                 with patch("bot.bot.send_message", new_callable=AsyncMock):
                     with patch("database.mark_user_sent", new_callable=AsyncMock) as mock_mark:
-                        await _send_personalized_digest(111, 111, items, record_sent=True)
+                        await _send_personalized_digest(111, 111, items, record_sent=True, country="serbia")
                         mock_mark.assert_awaited_once_with(111, "https://test1.com")
 
     @pytest.mark.asyncio
@@ -470,7 +477,7 @@ class TestPerUserDigestDelivery:
         with patch("database.get_disabled_topics", return_value=set()):
             with patch("database.get_user_sent_links", return_value={"https://test1.com"}):
                 with patch("bot.bot.send_message", new_callable=AsyncMock) as mock_send:
-                    result = await _send_personalized_digest(111, 111, items, record_sent=True)
+                    result = await _send_personalized_digest(111, 111, items, record_sent=True, country="serbia")
                     assert result is False
                     mock_send.assert_not_called()
 
@@ -491,7 +498,7 @@ class TestPerUserDigestDelivery:
             with patch("database.get_user_sent_links", new_callable=AsyncMock) as mock_get:
                 with patch("bot.bot.send_message", new_callable=AsyncMock):
                     with patch("database.mark_user_sent", new_callable=AsyncMock) as mock_mark:
-                        result = await _send_personalized_digest(111, 111, items, record_sent=False)
+                        result = await _send_personalized_digest(111, 111, items, record_sent=False, country="serbia")
                         assert result is True
                         mock_get.assert_not_called()
                         mock_mark.assert_not_called()
@@ -598,23 +605,29 @@ class TestParserHardening:
         """"eviln1info.rs" ends with the same characters as "n1info.rs"
         but is a completely different, unrelated domain — plain
         str.endswith() would wrongly accept it."""
+        import config
         from parser import _domain_in_whitelist
 
-        assert _domain_in_whitelist("https://eviln1info.rs/fake") is False
-        assert _domain_in_whitelist("https://n1info.rs/real") is True
+        whitelist = config.get_whitelist_domains("serbia")
+        assert _domain_in_whitelist("https://eviln1info.rs/fake", whitelist) is False
+        assert _domain_in_whitelist("https://n1info.rs/real", whitelist) is True
 
     def test_whitelist_accepts_real_subdomain(self):
+        import config
         from parser import _domain_in_whitelist
 
-        assert _domain_in_whitelist("https://www.blic.rs/article") is True
+        whitelist = config.get_whitelist_domains("serbia")
+        assert _domain_in_whitelist("https://www.blic.rs/article", whitelist) is True
 
     def test_entry_link_returns_none_for_unwhitelisted_link(self):
         """No fallback to an unwhitelisted link — if nothing in the entry
         matches, the entry is dropped, not forwarded anyway."""
+        import config
         from parser import _entry_link
 
+        whitelist = config.get_whitelist_domains("serbia")
         entry = {"links": [{"href": "https://eviln1info.rs/fake"}]}
-        assert _entry_link(entry) is None
+        assert _entry_link(entry, whitelist) is None
 
     def test_pub_date_without_timezone_is_utc_aware(self):
         """A naive datetime here would raise TypeError when compared
@@ -1372,7 +1385,14 @@ class TestRealEstateTranslation:
             assert "Белград, Врачар" in caption
 
     @pytest.mark.asyncio
-    async def test_menu_listing_skips_translation_for_russian_fields(self):
+    async def test_menu_listing_leaves_russian_fields_unchanged(self):
+        """translate_to_russian() itself no-ops for already-Russian text
+        before making any network call (see translator.py) — bot.py no
+        longer duplicates that check with its own detect_language() gate
+        (that used to also mean Georgian/Armenian/Turkish-script listings
+        never got translated at all, since that heuristic only recognizes
+        Cyrillic vs. Latin), so the function is always called here, but a
+        Russian field must still come back unchanged."""
         from bot import _send_real_estate_listing
 
         message = AsyncMock()
@@ -1383,9 +1403,11 @@ class TestRealEstateTranslation:
             "url": "https://example.com/2",
             "image_url": None,
         }
-        with patch("bot.translate_to_russian", new=AsyncMock()) as mock_translate:
+        with patch("bot.translate_to_russian", new=AsyncMock(side_effect=lambda t: t)):
             await _send_real_estate_listing(message, row, 1)
-            mock_translate.assert_not_called()
+            caption = message.answer.call_args.args[0]
+            assert "Квартира в центре города" in caption
+            assert "Белград, центр" in caption
 
 
 if __name__ == "__main__":
