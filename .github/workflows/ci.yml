@@ -39,3 +39,25 @@ jobs:
           CHAT_ID: "123456"
           GIGACHAT_CREDENTIALS: "test:cred"
         run: python -m pytest -v
+
+  deploy:
+    needs: test
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Deploy to production (EU VPS) over SSH
+        uses: appleboy/ssh-action@0ff4204d59e8e51228ff73bce53f80d53301dee2 # v1.2.5
+        with:
+          host: ${{ secrets.DEPLOY_HOST }}
+          username: ${{ secrets.DEPLOY_USER }}
+          key: ${{ secrets.DEPLOY_SSH_KEY }}
+          script: |
+            set -e
+            cd /root/msp-news-bot
+            git fetch origin main
+            git reset --hard origin/main
+            source venv/bin/activate
+            pip install --no-build-isolation -r requirements.txt
+            systemctl restart msp-news-bot
+            sleep 3
+            systemctl is-active --quiet msp-news-bot
