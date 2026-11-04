@@ -1,4 +1,4 @@
-"""Web search module for Serbian information with source links."""
+"""Web search module for relocation-country information with source links."""
 
 from __future__ import annotations
 
@@ -76,12 +76,13 @@ async def search_web(query: str, num_results: int = 5) -> list[SearchResult]:
     return results
 
 
-async def search_serbia_info(query: str) -> tuple[str, list[SearchResult]]:
-    """Search for information about Serbia and return answer with sources."""
-    # Add "Serbia" or "Сербия" to the query if not already present
-    query_lower = query.lower()
-    if "сербия" not in query_lower and "serbia" not in query_lower and "сербск" not in query_lower:
-        query = f"{query} Сербия"
+async def search_country_info(query: str, country_name: str) -> tuple[str, list[SearchResult]]:
+    """Search for information about `country_name` and return answer with sources."""
+    # Add the country name to the query if not already present, so a bare
+    # "как получить ВНЖ?" actually searches for the right country instead
+    # of whatever the search engine guesses.
+    if country_name.lower() not in query.lower():
+        query = f"{query} {country_name}"
 
     # Search for information
     search_results = await search_web(query, num_results=5)
@@ -120,7 +121,7 @@ def format_answer_with_sources(answer: str, sources: list[SearchResult]) -> str:
 
 
 # System prompt for GigaChat with context
-SERBIA_EXPERT_PROMPT = """Ты — эксперт по Сербии, который помогает людям, рассматривающим переезд из России в Сербию.
+COUNTRY_EXPERT_PROMPT_TEMPLATE = """Ты — эксперт по стране {country_name}, который помогает людям, рассматривающим переезд из России (направление: {country_name}).
 
 Ты получаешь контекст из интернет-поиска с актуальной информацией и ссылками на источники.
 
@@ -134,10 +135,10 @@ SERBIA_EXPERT_PROMPT = """Ты — эксперт по Сербии, котор�
 Ты специализируешься на информации для русскоязычных людей, планирующих переезд."""
 
 
-async def get_serbia_answer(query: str) -> str:
-    """Get an answer about Serbia with source links."""
+async def get_country_answer(query: str, country_name: str) -> str:
+    """Get an answer about `country_name` with source links."""
     # Search for information
-    context, sources = await search_serbia_info(query)
+    context, sources = await search_country_info(query, country_name)
 
     if not sources:
         return "К сожалению, не удалось найти актуальную информацию по вашему запросу. Попробуйте переформулировать вопрос."
@@ -146,7 +147,7 @@ async def get_serbia_answer(query: str) -> str:
     from gigachat.models.chat import Messages
 
     messages = [
-        Messages(role="system", content=SERBIA_EXPERT_PROMPT),
+        Messages(role="system", content=COUNTRY_EXPERT_PROMPT_TEMPLATE.format(country_name=country_name)),
         Messages(role="user", content=f"Контекст из интернета:\n\n{context}\n\nВопрос пользователя: {query}\n\nОтветь на вопрос, используя информацию из контекста. Указывай источники в формате [номер] в тексте ответа."),
     ]
 

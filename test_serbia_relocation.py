@@ -268,8 +268,8 @@ class TestGigaChatResilience:
         with patch("bot.get_gigachat_client", return_value=mock_giga):
             from bot import handle_question
             message = AsyncMock()
-            # Deliberately generic text: a Serbia/relocation-flavored question
-            # would route through get_serbia_answer()'s web-search branch
+            # Deliberately generic text: a relocation-flavored question
+            # would route through get_country_answer()'s web-search branch
             # instead of the plain-GigaChat branch this test targets.
             message.text = "Test question"
             message.from_user.id = 123

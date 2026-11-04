@@ -36,7 +36,7 @@ from real_estate import (
     is_real_estate_query,
     refresh_real_estate_database,
 )
-from serbia_search import get_serbia_answer
+from serbia_search import get_country_answer
 from telegram_format import split_telegram_message, telegram_link, telegram_text
 from translator import translate_to_russian
 from url_safety import is_safe_to_fetch
@@ -108,10 +108,45 @@ SYSTEM_PROMPT_TEMPLATE = """Ты — эксперт по релокации из
 
 Ты специализируешься на информации для русскоязычных людей, планирующих переезд."""
 
+# Used for every country except Serbia — phrased to avoid needing
+# per-country Russian grammatical case data (e.g. "Направление: Турция",
+# not "в Турцию"; see get_welcome_text()'s docstring for the same issue).
+SYSTEM_PROMPT_TEMPLATE_GENERIC = """Ты — эксперт по релокации из России. Направление пользователя: {country_name} ({country_flag}).
 
-def get_system_prompt() -> str:
-    """Get system prompt with current date."""
-    return SYSTEM_PROMPT_TEMPLATE.format(current_date=get_current_date())
+Текущая дата: {current_date}
+
+Ты работаешь в Telegram-боте, который помогает людям, рассматривающим переезд из России. Вот что бот умеет:
+- /digest — получить сводку актуальных новостей о выбранном направлении и релокации за сегодня
+- Автоматическая ежедневная рассылка новостей в 20:00 МСК
+- Ответы на вопросы о жизни в выбранной стране/регионе, переезде, визах, работе, недвижимости
+
+Отвечай на вопросы пользователей применительно к направлению {country_name} — о:
+- Работе: трудоустройство, визы, рабочие разрешения, налоговая система
+- Недвижимости: покупка, аренда, цены на рынке, юридические аспекты
+- Образовании: школы и детские сады для детей, университеты для взрослых
+- Новостях: политика, экономика, изменения в законах
+- Ограничениях для переезда: визовые требования, таможенные правила, запреты
+- Повседневной жизни: медицина, банковская система, язык, культура
+- Оформлении документов: ВНЖ, ПМЖ, гражданство, регистрация (где применимо)
+
+ВАЖНЫЕ ПРАВИЛА:
+- Используй ТОЛЬКО свежую информацию (учитывай текущую дату)
+- Если информации нет или она устаревшая, ЧЕСТНО скажи об этом
+- Указывай дату и источник информации, когда это возможно
+- Отвечай кратко, по делу, на русском языке
+- Если не знаешь точный ответ — скажи об этом, не придумывай
+
+Ты специализируешься на информации для русскоязычных людей, планирующих переезд."""
+
+
+def get_system_prompt(country: str = config.DEFAULT_COUNTRY) -> str:
+    """Get system prompt with current date, tailored to `country`."""
+    if country == "serbia":
+        return SYSTEM_PROMPT_TEMPLATE.format(current_date=get_current_date())
+    info = config.COUNTRIES.get(country, config.COUNTRIES[config.DEFAULT_COUNTRY])
+    return SYSTEM_PROMPT_TEMPLATE_GENERIC.format(
+        current_date=get_current_date(), country_name=info["name"], country_flag=info["flag"],
+    )
 
 
 # --- Keyboard builders ---
@@ -158,8 +193,30 @@ async def settings_topics_kb(user_id: int) -> InlineKeyboardMarkup:
         rows.append([InlineKeyboardButton(
             text=f"{mark} {label}", callback_data=f"topic_toggle:{key}",
         )])
+    current = config.COUNTRIES.get(country, config.COUNTRIES[config.DEFAULT_COUNTRY])
+    rows.append([InlineKeyboardButton(
+        text=f"🌍 Страна: {current['flag']} {current['name']} (сменить)",
+        callback_data="country_menu",
+    )])
     rows.append([InlineKeyboardButton(text="◀️ Назад", callback_data="cmd_start")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def country_select_kb() -> InlineKeyboardMarkup:
+    rows = [
+        [InlineKeyboardButton(
+            text=f"{info['flag']} {info['name']}", callback_data=f"country_select:{code}",
+        )]
+        for code, info in config.COUNTRIES.items()
+    ]
+    rows.append([InlineKeyboardButton(text="◀️ Назад", callback_data="settings_menu")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+COUNTRY_SELECT_TEXT = (
+    "🌍 <b>Выберите страну/регион</b> — для неё буду присылать новости "
+    "и подбирать недвижимость:"
+)
 
 
 def back_button_kb() -> InlineKeyboardMarkup:
@@ -500,6 +557,34 @@ WELCOME_TEXT = (
 SIMPLE_MENU_TEXT = "Выберите действие:"
 
 
+def get_welcome_text(country: str) -> str:
+    """Welcome text for a user who just picked (or already has) `country`.
+
+    Serbia keeps the original hand-written text verbatim (grammatically
+    correct Russian case endings for Serbia specifically) — the other
+    countries get a generated version phrased to avoid needing per-country
+    grammatical case data (e.g. "Направление: Турция", not "в Турцию").
+    """
+    if country == "serbia":
+        return WELCOME_TEXT
+    info = config.COUNTRIES.get(country, config.COUNTRIES[config.DEFAULT_COUNTRY])
+    return (
+        "👋 <b>Добро пожаловать!</b>\n\n"
+        f"Я — бот для помощи с релокацией. Направление: {info['flag']} <b>{info['name']}</b>.\n"
+        "Автоматически собираю актуальные новости и отвечаю на вопросы.\n\n"
+        "📌 <b>Что умеют кнопки:</b>\n\n"
+        "📋 <b>Сводка</b> — ежедневная подборка новостей\n"
+        "📰 <b>Новости</b> — последние новости из базы\n"
+        "📊 <b>Статус</b> — проверить, работает ли бот\n"
+        "❓ <b>Помощь</b> — справка по всем функциям\n"
+        "🏠 <b>Недвижимость</b> — подбор объявлений\n\n"
+        "💬 Просто напишите текст — и я отвечу с помощью ИИ!\n\n"
+        "🕐 Сводка приходит автоматически в <b>20:00</b> МСК\n\n"
+        "⚠️ Использую только свежую информацию\n\n"
+        "🌍 Страну можно сменить в любой момент — Настройки → Сменить страну."
+    )
+
+
 # --- Command handlers (slash commands still work) ---
 
 @dp.message(CommandStart())
@@ -514,10 +599,39 @@ async def cmd_start(message: Message) -> None:
     # the user has scrolled. Only needs setting once; Telegram remembers it.
     await message.answer("🤖 Бот готов к работе.", reply_markup=persistent_menu_kb())
 
+    country = await database.get_user_country(user_id)
+    if country is None:
+        # Brand new user (register_user() deliberately leaves country NULL
+        # until they pick one — see database.init_db()'s migration note).
+        await message.answer(COUNTRY_SELECT_TEXT, parse_mode="HTML", reply_markup=country_select_kb())
+        return
+
     if new:
-        await message.answer(WELCOME_TEXT, parse_mode="HTML", reply_markup=main_menu_kb())
+        await message.answer(get_welcome_text(country), parse_mode="HTML", reply_markup=main_menu_kb())
     else:
         await message.answer(SIMPLE_MENU_TEXT, reply_markup=main_menu_kb())
+
+
+@dp.callback_query(F.data == "country_menu")
+async def cb_country_menu(callback: CallbackQuery) -> None:
+    await callback.message.edit_text(
+        COUNTRY_SELECT_TEXT, parse_mode="HTML", reply_markup=country_select_kb(),
+    )
+    await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("country_select:"))
+async def cb_country_select(callback: CallbackQuery) -> None:
+    code = callback.data.split(":", 1)[1]
+    if code not in config.COUNTRIES:
+        await callback.answer("Неизвестная страна")
+        return
+    user_id = callback.from_user.id
+    await database.set_user_country(user_id, code)
+    await callback.message.edit_text(
+        get_welcome_text(code), parse_mode="HTML", reply_markup=main_menu_kb(),
+    )
+    await callback.answer(f"Страна выбрана: {config.COUNTRIES[code]['name']}")
 
 
 @dp.message(Command("help"))
@@ -727,14 +841,90 @@ async def _send_real_estate_listing(message: Message, row: dict, idx: int) -> No
     await message.answer(caption, parse_mode="HTML", disable_web_page_preview=True)
 
 
+async def _send_property_listings(target, listings: list, is_predefined: bool) -> int:
+    """Render up to 5 PropertyListing results as photo+caption messages.
+
+    `target` is anything with .answer()/.answer_photo() — a Message, or a
+    CallbackQuery's .message. Shared by the free-text "find me a listing"
+    flow and the real-estate menu for countries without a structured
+    city/deal-type breakdown yet (see cb_real_estate_menu below). Returns
+    how many were actually sent (capped at 5).
+    """
+    if is_predefined:
+        await target.answer(
+            "⚠️ Не удалось получить свежие данные с сайтов. Ниже — примерные "
+            "варианты, актуальность цен и наличие не гарантированы, "
+            "проверяйте по ссылке.",
+        )
+
+    for i, listing in enumerate(listings[:5]):
+        title = await translate_to_russian(listing.title) if listing.title else listing.title
+        price = telegram_text(listing.price) if listing.price else "не указана"
+        raw_location = listing.location
+        if raw_location:
+            raw_location = await translate_to_russian(raw_location)
+        location = telegram_text(raw_location) if raw_location else "не указана"
+        caption = (
+            f"<b>📌 {i+1}. {telegram_text(title)}</b>\n"
+            f"💰 Цена: {price}\n"
+            f"📍 Локация: {location}\n"
+            f"🌐 Источник: {telegram_text(listing.source)}\n"
+            f"🔗 {telegram_link(listing.url, 'Подробнее')}"
+        )
+
+        if listing.image_url and await is_safe_to_fetch(listing.image_url):
+            try:
+                photo = URLInputFile(listing.image_url)
+                await target.answer_photo(photo=photo, caption=caption, parse_mode="HTML")
+                continue
+            except Exception as photo_exc:
+                logger.warning("Failed to send photo: %s", photo_exc)
+        await target.answer(caption, parse_mode="HTML", disable_web_page_preview=True)
+
+    return min(len(listings), 5)
+
+
 @dp.callback_query(F.data == "re_menu")
 async def cb_real_estate_menu(callback: CallbackQuery) -> None:
-    await callback.message.edit_text(
-        "🏠 <b>Недвижимость в Сербии</b>\n\nВыберите город:",
-        parse_mode="HTML",
-        reply_markup=real_estate_city_kb(),
-    )
+    user_id = callback.from_user.id
+    country = await database.get_user_country(user_id) or config.DEFAULT_COUNTRY
+
+    if country == "serbia":
+        await callback.message.edit_text(
+            "🏠 <b>Недвижимость в Сербии</b>\n\nВыберите город:",
+            parse_mode="HTML",
+            reply_markup=real_estate_city_kb(),
+        )
+        await callback.answer()
+        return
+
+    # Other countries don't have the city/deal-type checkbox flow yet (see
+    # TaskList) — show whatever search_real_estate_with_fallback() has
+    # directly: DB-backed listings if the collector has populated them,
+    # otherwise the country's single curated fallback link.
+    info = config.COUNTRIES[country]
     await callback.answer()
+    await callback.message.edit_text(
+        f"🏠 <b>Недвижимость — {info['flag']} {info['name']}</b>\n\n🔍 Ищу актуальные предложения...",
+        parse_mode="HTML",
+    )
+    try:
+        listings, is_predefined = await search_real_estate_with_fallback("", country=country)
+    except Exception as exc:
+        logger.error("Real estate search error (%s): %s", country, exc)
+        await callback.message.answer(
+            "⚠️ Ошибка при поиске недвижимости. Попробуйте позже.",
+            reply_markup=back_button_kb(),
+        )
+        return
+
+    if not listings:
+        await callback.message.answer("📭 Пока ничего не нашлось.", reply_markup=back_button_kb())
+        return
+
+    count = await _send_property_listings(callback.message, listings, is_predefined)
+    note = " (примерные варианты, не живые данные)" if is_predefined else ""
+    await callback.message.answer(f"Показано предложений: {count}.{note}", reply_markup=back_button_kb())
 
 
 @dp.callback_query(F.data.startswith("re_city:"))
@@ -934,6 +1124,9 @@ async def handle_question(message: Message) -> None:
     history = await database.get_conversation_history(user_id, limit=10)
     await database.save_message(user_id, "user", user_text)
 
+    country = await database.get_user_country(user_id) or config.DEFAULT_COUNTRY
+    country_name = config.COUNTRIES[country]["name"]
+
     # Check if the query is about real estate
     real_estate_type = is_real_estate_query(user_text)
     answer = ""  # Initialize answer variable
@@ -943,12 +1136,10 @@ async def handle_question(message: Message) -> None:
         # This branch fully handles its own replies (one message per listing),
         # so it saves history and returns early instead of falling through to
         # the generic answer-sending code at the end of the handler.
-        re_country = await database.get_user_country(user_id) or config.DEFAULT_COUNTRY
-        re_country_name = config.COUNTRIES[re_country]["name"]
-        await message.answer(f"🔍 Ищу актуальные предложения недвижимости в стране: {re_country_name}...")
+        await message.answer(f"🔍 Ищу актуальные предложения недвижимости в стране: {country_name}...")
 
         try:
-            listings, is_predefined = await search_real_estate_with_fallback(user_text, country=re_country)
+            listings, is_predefined = await search_real_estate_with_fallback(user_text, country=country)
 
             if not listings:
                 answer = "📋 <b>Популярные сайты для поиска недвижимости:</b>\n"
@@ -956,44 +1147,8 @@ async def handle_question(message: Message) -> None:
                 answer += "• <a href=\"https://www.avito.ru/all/serbiya/nedvizhimost\">Авито</a>\n"
                 await message.answer(answer, parse_mode="HTML", disable_web_page_preview=True)
             else:
-                if is_predefined:
-                    await message.answer(
-                        "⚠️ Не удалось получить свежие данные с сайтов. Ниже — примерные "
-                        "варианты, актуальность цен и наличие не гарантированы, "
-                        "проверяйте по ссылке.",
-                    )
-
-                # Send first listing with photo if available
-                for i, listing in enumerate(listings[:5]):
-                    title = await translate_to_russian(listing.title) if listing.title else listing.title
-                    price = telegram_text(listing.price) if listing.price else "не указана"
-                    raw_location = listing.location
-                    if raw_location:
-                        raw_location = await translate_to_russian(raw_location)
-                    location = telegram_text(raw_location) if raw_location else "не указана"
-                    caption = (
-                        f"<b>📌 {i+1}. {telegram_text(title)}</b>\n"
-                        f"💰 Цена: {price}\n"
-                        f"📍 Локация: {location}\n"
-                        f"🌐 Источник: {telegram_text(listing.source)}\n"
-                        f"🔗 {telegram_link(listing.url, 'Подробнее')}"
-                    )
-
-                    if listing.image_url and await is_safe_to_fetch(listing.image_url):
-                        try:
-                            photo = URLInputFile(listing.image_url)
-                            await message.answer_photo(
-                                photo=photo,
-                                caption=caption,
-                                parse_mode="HTML",
-                            )
-                        except Exception as photo_exc:
-                            logger.warning("Failed to send photo: %s", photo_exc)
-                            await message.answer(caption, parse_mode="HTML", disable_web_page_preview=True)
-                    else:
-                        await message.answer(caption, parse_mode="HTML", disable_web_page_preview=True)
-
-                answer = f"Показано предложений недвижимости: {min(len(listings), 5)}."
+                count = await _send_property_listings(message, listings, is_predefined)
+                answer = f"Показано предложений недвижимости: {count}."
                 if is_predefined:
                     answer += " (примерные варианты, не живые данные)"
 
@@ -1009,36 +1164,33 @@ async def handle_question(message: Message) -> None:
         # User wants information about real estate process/features
         await message.answer("🔍 Ищу актуальную информацию...")
         try:
-            answer = await get_serbia_answer(user_text)
+            answer = await get_country_answer(user_text, country_name)
         except Exception as exc:
-            logger.error("Serbia search error: %s", exc)
+            logger.error("Country search error: %s", exc)
             answer = "⚠️ Ошибка при поиске информации. Попробуйте позже."
 
     else:
-        # Check if the query is about Serbia
+        # Check if the query is about relocation to the user's country —
+        # config.get_all_keywords() already blends the generic Russian
+        # relocation/work/documents terms with that country's local terms
+        # (see config.py), so this works the same way for every country.
         query_lower = user_text.lower()
-        is_serbia_query = any(kw in query_lower for kw in [
-            "сербия", "сербск", "белград", "belgrade", "serbia",
-            "виза", "внж", "пмж", "гражданств",
-            "недвижим", "квартир", "дом", "аренд",
-            "работа", "трудоустро", "образован", "школ",
-            "банк", "налог", "документ",
-        ])
+        is_relocation_query = any(kw in query_lower for kw in config.get_all_keywords(country))
 
-        if is_serbia_query:
-            # Search web for information about Serbia with source links
+        if is_relocation_query:
+            # Search the web for information with source links
             await message.answer("🔍 Ищу актуальную информацию...")
             try:
-                answer = await get_serbia_answer(user_text)
+                answer = await get_country_answer(user_text, country_name)
             except Exception as exc:
-                logger.error("Serbia search error: %s", exc)
+                logger.error("Country search error: %s", exc)
                 answer = "⚠️ Ошибка при поиске информации. Попробуйте позже."
         else:
             # Use GigaChat for other questions (without web search).
             # `history` was read at the top of this handler, before the
             # current question was saved — so it holds only the prior
             # turns and the question is appended once, explicitly.
-            messages = [Messages(role="system", content=get_system_prompt())]
+            messages = [Messages(role="system", content=get_system_prompt(country))]
             for msg in history:
                 messages.append(Messages(role=msg["role"], content=msg["content"]))
             messages.append(Messages(role="user", content=user_text))
@@ -1139,8 +1291,10 @@ async def handle_voice(message: Message) -> None:
     history = await database.get_conversation_history(user_id, limit=10)
     await database.save_message(user_id, "user", text)
 
+    country = await database.get_user_country(user_id) or config.DEFAULT_COUNTRY
+
     # Build messages with history
-    messages = [Messages(role="system", content=get_system_prompt())]
+    messages = [Messages(role="system", content=get_system_prompt(country))]
     for msg in history:
         messages.append(Messages(role=msg["role"], content=msg["content"]))
     messages.append(Messages(role="user", content=text))
